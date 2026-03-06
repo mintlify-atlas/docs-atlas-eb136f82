@@ -1,0 +1,477 @@
+---
+title: "Worker Communication"
+description: "MCP tools for worker status reporting and inter-agent messaging"
+---
+
+Worker communication tools enable agents to report their status and exchange messages with each other, the coordinator, and the user.
+
+## enki_worker_report
+
+Report current high-level activity to let the user see what you're working on. Workers should call this periodically to provide progress updates.
+
+<ParamField path="status" type="string" required>
+  Brief description of current activity (e.g. "analyzing codebase", "running tests", "implementing auth middleware")
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_worker_report",
+    "arguments": {
+      "status": "analyzing codebase structure"
+    }
+  }
+}
+```
+
+### Usage Pattern
+
+Workers should report status at key milestones:
+- When starting a new phase of work
+- After completing major steps
+- When encountering blockers or waiting for external resources
+- Before making potentially time-consuming operations
+
+```python
+# Good reporting cadence
+await call_tool("enki_worker_report", status="reading project files")
+files = read_files()
+
+await call_tool("enki_worker_report", status="analyzing dependencies")
+deps = analyze(files)
+
+await call_tool("enki_worker_report", status="generating code changes")
+changes = generate(deps)
+```
+
+<Note>
+  Status reports are visible in the TUI's worker panel. Keep them concise and action-oriented.
+</Note>
+
+---
+
+## Mail System
+
+The mail system enables asynchronous communication between workers, the coordinator, and the user. Messages are stored in the SQLite database and can be tracked by thread.
+
+### Addressing
+
+Valid recipient addresses:
+- `coordinator` — The planner agent
+- `worker/<task_id>` — Specific worker by task ID
+- `@workers` — Broadcast to all active workers
+- `user` — Direct message to the user (appears in TUI)
+
+### Message Types
+
+- **info** — Informational message, no response expected
+- **request** — Trackable request that expects a reply (auto-generates thread_id)
+
+### Priority Levels
+
+- `low` — Low priority, process when convenient
+- `normal` — Standard priority (default)
+- `high` — Important, process soon
+- `urgent` — Critical, process immediately
+
+---
+
+## enki_mail_send
+
+Send a message to another worker, the coordinator, or the user.
+
+<ParamField path="to" type="string" required>
+  Recipient address (e.g. "coordinator", "worker/task-01JXX...", "@workers", "user")
+</ParamField>
+
+<ParamField path="subject" type="string" required>
+  Brief subject line
+</ParamField>
+
+<ParamField path="body" type="string" required>
+  Message body
+</ParamField>
+
+<ParamField path="priority" type="string">
+  Message priority: `low`, `normal`, `high`, `urgent`. Defaults to `normal`.
+</ParamField>
+
+<ParamField path="thread_id" type="string">
+  Optional thread ID to group related messages
+</ParamField>
+
+<ParamField path="reply_to" type="string">
+  Optional message ID this is a reply to
+</ParamField>
+
+<ParamField path="msg_type" type="string">
+  Message type: `info` or `request`. Defaults to `info`. Use `request` for trackable requests with auto-generated thread_id.
+</ParamField>
+
+<ParamField path="ttl_seconds" type="integer">
+  Message expires after this many seconds. Omit for no expiration.
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_send",
+    "arguments": {
+      "to": "coordinator",
+      "subject": "API endpoint discovery",
+      "body": "Found 15 REST endpoints. Should I document all of them or just the public ones?",
+      "msg_type": "request",
+      "priority": "normal"
+    }
+  }
+}
+```
+
+### Usage Patterns
+
+**Worker → Coordinator (requesting clarification):**
+```json
+{
+  "to": "coordinator",
+  "subject": "Architecture decision needed",
+  "body": "Should I use sessions or JWT for authentication?",
+  "msg_type": "request",
+  "priority": "high"
+}
+```
+
+**Worker → Worker (sharing context):**
+```json
+{
+  "to": "worker/task-01JXABC",
+  "subject": "Auth middleware complete",
+  "body": "I've implemented JWT middleware in middleware/auth.rs. It verifies tokens and attaches user context to requests.",
+  "msg_type": "info"
+}
+```
+
+**Worker → User (escalation):**
+```json
+{
+  "to": "user",
+  "subject": "Database migration required",
+  "body": "This feature requires a new 'sessions' table. Should I proceed with the migration?",
+  "msg_type": "request",
+  "priority": "urgent"
+}
+```
+
+**Broadcast:**
+```json
+{
+  "to": "@workers",
+  "subject": "Breaking change in API",
+  "body": "The auth endpoint now requires a 'scope' parameter. Update any references.",
+  "msg_type": "info"
+}
+```
+
+---
+
+## enki_mail_check
+
+Check your inbox for unread messages. Returns count and summary of unread messages.
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_check",
+    "arguments": {}
+  }
+}
+```
+
+### Response Example
+
+```json
+{
+  "unread_count": 2,
+  "messages": [
+    {
+      "id": "msg-01JXABC",
+      "from": "coordinator",
+      "subject": "Re: Architecture decision needed",
+      "received_at": "2026-03-06T10:30:00Z",
+      "priority": "high"
+    },
+    {
+      "id": "msg-01JXDEF",
+      "from": "worker/task-01JXGHI",
+      "subject": "Test results",
+      "received_at": "2026-03-06T10:25:00Z",
+      "priority": "normal"
+    }
+  ]
+}
+```
+
+---
+
+## enki_mail_read
+
+Read a specific message by ID and mark it as read.
+
+<ParamField path="message_id" type="string" required>
+  ID of the message to read
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_read",
+    "arguments": {
+      "message_id": "msg-01JXABC"
+    }
+  }
+}
+```
+
+### Response Example
+
+```json
+{
+  "id": "msg-01JXABC",
+  "from": "coordinator",
+  "to": "worker/task-01JXDEF",
+  "subject": "Re: Architecture decision needed",
+  "body": "Use JWT for authentication. It integrates better with the existing API structure.",
+  "priority": "high",
+  "msg_type": "info",
+  "reply_to": "msg-01JXAAA",
+  "thread_id": "thread-01JXBBB",
+  "sent_at": "2026-03-06T10:30:00Z",
+  "read": true
+}
+```
+
+---
+
+## enki_mail_inbox
+
+List all messages in your inbox (read and unread).
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_inbox",
+    "arguments": {}
+  }
+}
+```
+
+### Response Example
+
+```json
+{
+  "messages": [
+    {
+      "id": "msg-01JXABC",
+      "from": "coordinator",
+      "subject": "Re: Architecture decision needed",
+      "sent_at": "2026-03-06T10:30:00Z",
+      "priority": "high",
+      "read": true
+    },
+    {
+      "id": "msg-01JXDEF",
+      "from": "worker/task-01JXGHI",
+      "subject": "Test results",
+      "sent_at": "2026-03-06T10:25:00Z",
+      "priority": "normal",
+      "read": false
+    }
+  ]
+}
+```
+
+---
+
+## enki_mail_reply
+
+Reply to a request message. Updates the original request's status and sends a response back to the sender.
+
+<ParamField path="message_id" type="string" required>
+  ID of the request message to reply to
+</ParamField>
+
+<ParamField path="body" type="string" required>
+  Response body
+</ParamField>
+
+<ParamField path="status" type="string">
+  Status to set on the original request: `accepted`, `rejected`, `completed`. Defaults to `accepted`.
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_reply",
+    "arguments": {
+      "message_id": "msg-01JXABC",
+      "body": "I've reviewed the endpoints. I'll document all 15, with clear markers for internal vs public APIs.",
+      "status": "accepted"
+    }
+  }
+}
+```
+
+### Status Values
+
+- **accepted** — You've acknowledged the request and will act on it
+- **rejected** — You cannot or will not fulfill the request
+- **completed** — You've finished the requested work
+
+<Tip>
+  Always reply to `request` type messages to close the loop and update the sender.
+</Tip>
+
+---
+
+## enki_mail_thread
+
+View all messages in a conversation thread, in chronological order.
+
+<ParamField path="thread_id" type="string" required>
+  Thread ID to view
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "enki_mail_thread",
+    "arguments": {
+      "thread_id": "thread-01JXBBB"
+    }
+  }
+}
+```
+
+### Response Example
+
+```json
+{
+  "thread_id": "thread-01JXBBB",
+  "messages": [
+    {
+      "id": "msg-01JXAAA",
+      "from": "worker/task-01JXDEF",
+      "to": "coordinator",
+      "subject": "Architecture decision needed",
+      "body": "Should I use sessions or JWT for authentication?",
+      "sent_at": "2026-03-06T10:15:00Z"
+    },
+    {
+      "id": "msg-01JXABC",
+      "from": "coordinator",
+      "to": "worker/task-01JXDEF",
+      "subject": "Re: Architecture decision needed",
+      "body": "Use JWT for authentication. It integrates better with the existing API structure.",
+      "reply_to": "msg-01JXAAA",
+      "sent_at": "2026-03-06T10:30:00Z"
+    }
+  ]
+}
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="When to use mail vs direct communication">
+    **Use mail when:**
+    - Requesting clarification that isn't urgent
+    - Sharing context with other workers
+    - Escalating decisions to the user
+    - Broadcasting status to all workers
+    
+    **Use direct signal files when:**
+    - Creating/pausing/canceling tasks (use execution control tools)
+    - Reporting critical errors that need immediate coordinator attention
+  </Accordion>
+
+  <Accordion title="Message threading">
+    Always use `reply_to` and `thread_id` for multi-turn conversations. This keeps related messages grouped and makes it easier to track context.
+    
+    When sending a `request` type message, the system auto-generates a `thread_id` for you.
+  </Accordion>
+
+  <Accordion title="Priority guidelines">
+    - **urgent** — Blocking issues, critical errors, user-facing problems
+    - **high** — Architecture decisions, merge conflicts, test failures
+    - **normal** — Status updates, context sharing, routine questions
+    - **low** — Nice-to-have improvements, optional suggestions
+  </Accordion>
+
+  <Accordion title="Message expiration">
+    Use `ttl_seconds` for time-sensitive requests:
+    ```json
+    {
+      "to": "coordinator",
+      "subject": "Should I proceed with migration?",
+      "body": "...",
+      "msg_type": "request",
+      "ttl_seconds": 300
+    }
+    ```
+    If the coordinator doesn't respond within 5 minutes, the message expires and you can make your own decision.
+  </Accordion>
+</AccordionGroup>
+
+## Database Schema
+
+Messages are stored in the `messages` table with these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | String | Unique message ID |
+| `from_addr` | String | Sender address |
+| `to_addr` | String | Recipient address |
+| `subject` | String | Message subject |
+| `body` | String | Message content |
+| `priority` | String | Priority level |
+| `msg_type` | String | `info` or `request` |
+| `thread_id` | String | Optional thread grouping |
+| `reply_to` | String | Optional parent message ID |
+| `sent_at` | Timestamp | When message was sent |
+| `read` | Boolean | Whether recipient has read it |
+| `ttl_seconds` | Integer | Optional expiration time |
+
+## See Also
+
+- [Execution Control](/api/tools/execution-control) - Task and execution management tools
+- [Signal Files](/advanced/signal-files) - Direct coordinator communication via file IPC
+- [Architecture](/concepts/architecture) - Understanding the coordinator and worker roles

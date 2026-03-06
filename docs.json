@@ -81,7 +81,8 @@
             "pages": [
               "api/tools/overview",
               "api/tools/task-management",
-              "api/tools/execution-control"
+              "api/tools/execution-control",
+              "api/tools/worker-communication"
             ]
           },
           {

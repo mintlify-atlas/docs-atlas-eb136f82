@@ -102,7 +102,7 @@ Press Enter to submit.
 
 Here's what you might see:
 
-```
+```text
 [You]: Add documentation comments to all public functions in src/main.rs
 
 [Coordinator]: I'll create a task to add documentation to your public functions.
@@ -127,7 +127,7 @@ Here's what you might see:
 
 Enki excels at complex, multi-step work with dependencies. Try:
 
-```
+```text
 Add a new CLI command 'enki doctor' that checks system requirements,
 then write tests for it, and finally add documentation
 ```
@@ -194,7 +194,7 @@ ls ~/.enki/logs/sessions/
 ```
 
 Log files use this format:
-```
+```text
 ══════════════════ SESSION START ══════════════════
 [timestamp] INFO Starting coordinator...
 [timestamp] DEBUG Spawning worker for task-abc123
@@ -233,13 +233,13 @@ Log files use this format:
 Here are some real-world examples to try:
 
 ### Refactoring
-```
+```text
 Refactor the database module to use async/await,
 update all call sites, and ensure tests pass
 ```
 
 ### Feature Addition
-```
+```text
 Add a new API endpoint for user preferences,
 include validation and error handling,
 write integration tests,
@@ -247,7 +247,7 @@ and add OpenAPI documentation
 ```
 
 ### Bug Fix
-```
+```text
 Fix the memory leak in the connection pool,
 add a test that reproduces the issue,
 and document the fix in CHANGELOG.md
