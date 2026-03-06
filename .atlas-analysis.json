@@ -1,0 +1,127 @@
+{
+  "projectType": "cli-tool",
+  "projectName": "Enki",
+  "projectDescription": "Multi-agent coding orchestrator that spawns ACP agents in isolated project copies, manages them as a DAG, and merges their work back",
+  "theme": "aspen",
+  "primaryColor": "#fa4c2a",
+  "lightColor": "#443b33",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/dag-execution",
+              "concepts/worker-isolation",
+              "concepts/roles",
+              "concepts/merge-queue"
+            ]
+          },
+          {
+            "group": "Usage",
+            "pages": [
+              "usage/running-enki",
+              "usage/tui-interface",
+              "usage/creating-tasks",
+              "usage/managing-executions"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/custom-roles",
+              "advanced/mcp-tools",
+              "advanced/signal-files",
+              "advanced/hashlines"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "CLI Commands",
+            "pages": [
+              "api/enki",
+              "api/enki-mcp"
+            ]
+          },
+          {
+            "group": "MCP Tools",
+            "pages": [
+              "api/tools/overview",
+              "api/tools/task-management",
+              "api/tools/execution-control"
+            ]
+          },
+          {
+            "group": "Crate APIs",
+            "pages": [
+              "api/crates/core",
+              "api/crates/acp",
+              "api/crates/tui",
+              "api/crates/cli"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Development",
+        "groups": [
+          {
+            "group": "Contributing",
+            "pages": [
+              "development/setup",
+              "development/testing",
+              "development/architecture-deep-dive"
+            ]
+          },
+          {
+            "group": "Troubleshooting",
+            "pages": [
+              "troubleshooting/common-issues",
+              "troubleshooting/logs"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Multi-agent orchestration with DAG-based task dependencies",
+    "Copy-on-write worker isolation for safe parallel execution",
+    "Tier-based concurrency control (light/standard/heavy tasks)",
+    "Git-based merge queue with conflict resolution",
+    "Role system with customizable agent behaviors",
+    "MCP server for external tool access",
+    "Hashline-based content verification for atomic edits",
+    "TUI with streaming markdown rendering"
+  ],
+  "publicApiSurface": [
+    "enki - Launch TUI interface",
+    "enki mcp - Run as MCP stdio server",
+    "enki_task_create - MCP tool to create standalone tasks",
+    "enki_execution_create - MCP tool to create multi-step executions with dependencies",
+    "enki_status - MCP tool to show task counts by status",
+    "enki_task_list - MCP tool to list all tasks",
+    "enki_pause - MCP tool to pause executions or steps",
+    "enki_cancel - MCP tool to cancel executions or steps",
+    "enki_stop_all - MCP tool to stop all running workers",
+    "Orchestrator::handle - Core command processor",
+    "Scheduler::tick - DAG scheduler tick",
+    "AgentManager - ACP session lifecycle manager"
+  ]
+}
