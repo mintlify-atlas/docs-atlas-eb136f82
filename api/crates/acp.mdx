@@ -1,0 +1,327 @@
+---
+title: enki-acp
+description: Async ACP client for managing agent subprocesses
+---
+
+# enki-acp
+
+Async ACP client. Spawns agent subprocesses, manages sessions, routes streaming updates. All internal state is `Rc<RefCell<...>>` — **`!Send`**, must run on a `LocalSet`.
+
+<Note>
+**Critical:** All ACP code is `!Send` due to `Rc<RefCell<...>>` usage. You must run it on a dedicated OS thread with a `current_thread` tokio runtime + `LocalSet`. Never send ACP types across threads.
+</Note>
+
+## AgentManager
+
+The main interface for spawning and controlling ACP agent sessions.
+
+```rust
+pub struct AgentManager {
+    sessions: Rc<RefCell<HashMap<String, SessionEntry>>>,
+    update_callback: Rc<RefCell<Option<UpdateCallback>>>,
+    auto_approve_permissions: bool,
+    extra_env: Rc<HashMap<String, String>>,
+}
+
+impl AgentManager {
+    pub fn new() -> Self
+    
+    /// Set environment variables injected into every spawned subprocess.
+    pub fn set_env(&mut self, env: HashMap<String, String>)
+    
+    /// Set a callback to receive session updates from all agents.
+    pub fn on_update(&self, callback: impl Fn(&str, SessionUpdate) + 'static)
+    
+    /// Spawn a new agent process and return the session ID.
+    pub async fn start_session(
+        &self,
+        agent_cmd: &str,
+        agent_args: &[&str],
+        cwd: PathBuf,
+        label: &str,
+    ) -> Result<String>
+    
+    /// Spawn with MCP servers configured.
+    pub async fn start_session_with_mcp(
+        &self,
+        agent_cmd: &str,
+        agent_args: &[&str],
+        cwd: PathBuf,
+        mcp_servers: Vec<acp::McpServer>,
+        label: &str,
+    ) -> Result<String>
+    
+    /// Send a prompt to a session and wait for completion.
+    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<String>
+    
+    /// Cancel a running prompt (soft cancel — session stays alive).
+    pub async fn cancel(&self, session_id: &str) -> Result<()>
+    
+    /// Kill a session and its agent process.
+    pub fn kill_session(&self, session_id: &str)
+    
+    /// List all active session IDs.
+    pub fn session_ids(&self) -> Vec<String>
+}
+```
+
+## SessionUpdate
+
+Simplified session events for the orchestrator.
+
+```rust
+pub enum SessionUpdate {
+    /// Agent produced text output.
+    Text(String),
+    /// Agent started a tool call.
+    ToolCallStarted { id: String, title: String },
+    /// Agent finished a tool call.
+    ToolCallDone { id: String },
+    /// Agent updated its plan.
+    Plan(serde_json::Value),
+}
+
+pub type UpdateCallback = Box<dyn Fn(&str, SessionUpdate) + 'static>;
+```
+
+## AcpError
+
+```rust
+pub enum AcpError {
+    Protocol(agent_client_protocol::Error),
+    Io(std::io::Error),
+    SessionNotFound(String),
+    ProcessExited,
+}
+
+pub type Result<T> = std::result::Result<T, AcpError>;
+```
+
+## Usage Patterns
+
+### 1. Dedicated Thread + LocalSet
+
+**The right way:**
+
+```rust
+use enki_acp::AgentManager;
+
+// Spawn a dedicated OS thread for ACP operations
+std::thread::spawn(|| {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    
+    rt.block_on(async {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mgr = AgentManager::new();
+            
+            // All ACP operations happen inside this LocalSet
+            let session_id = mgr.start_session(
+                "npx",
+                &["@zed-industries/claude-agent-acp"],
+                std::env::current_dir().unwrap(),
+                "worker-1",
+            ).await.unwrap();
+            
+            let result = mgr.prompt(&session_id, "Fix the bug in auth.rs").await.unwrap();
+            println!("Agent finished: {}", result);
+            
+            mgr.kill_session(&session_id);
+        }).await;
+    });
+});
+```
+
+### 2. Session Lifecycle
+
+```rust
+let mgr = AgentManager::new();
+
+// 1. Set update callback to receive streaming events
+mgr.on_update(|session_id, update| {
+    match update {
+        SessionUpdate::Text(t) => println!("[{session_id}] {t}"),
+        SessionUpdate::ToolCallStarted { title, .. } => println!("[{session_id}] tool: {title}"),
+        _ => {}
+    }
+});
+
+// 2. Start a session
+let session_id = mgr.start_session(
+    "claude",
+    &["--acp"],
+    copy_path,
+    "task-abc123",
+).await?;
+
+// 3. Send prompts
+mgr.prompt(&session_id, "Implement rate limiting").await?;
+
+// 4. Cancel if needed
+mgr.cancel(&session_id).await?;
+
+// 5. Kill when done
+mgr.kill_session(&session_id);
+```
+
+### 3. MCP Server Configuration
+
+```rust
+use enki_acp::acp_schema::{McpServer, StdioTransport};
+
+let mcp_servers = vec![
+    McpServer::new(
+        "enki".into(),
+        StdioTransport::new(enki_bin.to_str().unwrap(), vec!["mcp", "--role", "worker"]),
+    ),
+];
+
+let session_id = mgr.start_session_with_mcp(
+    "claude",
+    &["--acp"],
+    copy_path,
+    mcp_servers,
+    "worker-1",
+).await?;
+```
+
+## Internal Architecture
+
+### `!Send` Boundary
+
+All ACP futures are `!Send` because:
+
+1. `ClientSideConnection` uses `Rc<...>` internally
+2. `AgentManager` wraps state in `Rc<RefCell<...>>` for shared mutable access within the same thread
+3. Sessions are stored in `HashMap` behind `Rc<RefCell<...>>`
+
+This design enables:
+- Callback closures that mutate shared state without `Arc<Mutex<...>>` overhead
+- Single-threaded event loop with zero contention
+- Natural integration with ACP's single-threaded design
+
+### Process Management
+
+```rust
+struct SessionEntry {
+    conn: Rc<acp::ClientSideConnection>,
+    _child_ref: Rc<RefCell<Option<tokio::process::Child>>>,
+}
+```
+
+Child processes are wrapped in `Rc<RefCell<Option<Child>>>` with `kill_on_drop(true)`. When `kill_session()` is called:
+
+1. The `SessionEntry` is removed from the `HashMap`
+2. `Rc` refcount drops to zero
+3. `RefCell<Option<Child>>` is dropped
+4. `Child::drop()` kills the process via `kill_on_drop`
+
+### Session Logging
+
+Every session logs JSON-RPC traffic to `~/.enki/logs/sessions/{label}.log`:
+
+```
+[14:23:45] → prompt id=1 params={"text":"Fix bug"}
+[14:23:46] ← toolCall id=2 params={"name":"read_text_file"}
+[14:23:46] → toolResult id=2 result={"content":"..."}
+[14:23:50] ← response id=1 result={"stop_reason":"end_turn"}
+```
+
+Logs are timestamped and truncated to 500 bytes per entry.
+
+## Common Patterns
+
+### Coordinator Loop
+
+```rust
+let mgr = AgentManager::new();
+let (tx, mut rx) = mpsc::unbounded_channel();
+
+mgr.on_update(move |session_id, update| {
+    tx.send((session_id.to_string(), update)).ok();
+});
+
+loop {
+    tokio::select! {
+        Some((sid, update)) = rx.recv() => {
+            // Handle session update
+        }
+        _ = tokio::time::sleep(Duration::from_secs(3)) => {
+            // Periodic tick
+        }
+    }
+}
+```
+
+### Spawning Multiple Agents
+
+```rust
+let mgr = AgentManager::new();
+let mut sessions = Vec::new();
+
+for i in 0..5 {
+    let sid = mgr.start_session(
+        "claude",
+        &["--acp"],
+        workspace.join(format!("copy-{i}")),
+        &format!("worker-{i}"),
+    ).await?;
+    sessions.push(sid);
+}
+
+// Dispatch work in parallel
+for (i, sid) in sessions.iter().enumerate() {
+    tokio::task::spawn_local({
+        let mgr = mgr.clone();
+        let sid = sid.clone();
+        async move {
+            mgr.prompt(&sid, &format!("Task {i}")).await.ok();
+        }
+    });
+}
+
+// Wait for all to finish, then kill
+for sid in &sessions {
+    mgr.kill_session(sid);
+}
+```
+
+## Error Handling
+
+```rust
+match mgr.prompt(&session_id, "Do work").await {
+    Ok(reason) => println!("Finished: {reason}"),
+    Err(AcpError::SessionNotFound(sid)) => {
+        eprintln!("Session {sid} not found");
+    }
+    Err(AcpError::ProcessExited) => {
+        eprintln!("Agent crashed");
+        mgr.kill_session(&session_id);
+    }
+    Err(e) => eprintln!("Error: {e}"),
+}
+```
+
+## Best Practices
+
+1. **Always use LocalSet:** Never call ACP methods from a multi-threaded runtime
+2. **One thread per coordinator:** Spawn a dedicated OS thread with `current_thread` runtime
+3. **Clone AgentManager freely:** It's `Clone` via `Rc` — all clones share the same state
+4. **Kill sessions explicitly:** Don't rely on drop — call `kill_session()` to clean up
+5. **Check session_ids() before prompting:** Ensure the session still exists
+6. **Use labels for debugging:** Session logs are named by label, not session ID
+
+## Re-exports
+
+```rust
+pub use agent_client_protocol as acp_schema;
+```
+
+Provides access to ACP protocol types for MCP server configuration:
+- `acp_schema::McpServer`
+- `acp_schema::StdioTransport`
+- `acp_schema::Implementation`
+- etc.

@@ -1,0 +1,233 @@
+---
+title: 'enki mcp'
+description: 'Run Enki as an MCP stdio server for ACP agents'
+---
+
+<Warning>
+  This command is **hidden** and intended for **internal use only** by ACP agents. It is automatically invoked by the Enki coordinator when spawning planner, worker, and merger agent subprocesses. You should not need to run this command directly.
+</Warning>
+
+## Command Signature
+
+```bash
+enki mcp [--role <ROLE>] [--task-id <TASK_ID>] [--no-edit]
+```
+
+## Description
+
+Launches Enki as an MCP (Model Context Protocol) stdio server. This mode exposes a set of tools to ACP agents via JSON-RPC over stdin/stdout, enabling them to interact with the Enki orchestration system.
+
+The coordinator spawns `enki mcp` processes with different roles and capabilities:
+
+- **Planner**: Full tool access for planning and decomposing tasks into a DAG
+- **Worker**: Standard file operations and reporting tools for executing individual tasks
+- **Merger**: Minimal tools for resolving merge conflicts in a temporary clone
+
+## Parameters
+
+<ParamField path="role" type="string" default="planner">
+  Agent role that controls which MCP tools are exposed:
+  
+  - `planner`: Full tool access (`PLANNER_TOOLS`)
+  - `worker`: Standard file operations (`WORKER_TOOLS`)
+  - `merger`: Minimal conflict resolution tools (`MERGER_TOOLS`)
+  
+  The role determines the security boundary and available capabilities for the agent.
+</ParamField>
+
+<ParamField path="task-id" type="string" default="None">
+  Task identifier for worker-role processes. Required by the `enki_worker_report` MCP tool to associate progress updates and completion signals with the correct task in the DAG.
+  
+  Only used when `--role worker`. Planner and merger roles do not require a task ID.
+</ParamField>
+
+<ParamField path="no-edit" type="boolean" default="false">
+  Disables file editing tools for this worker instance. Used for read-only roles like the `researcher` role, which should only read files and report findings without making changes.
+  
+  When set, exposes `WORKER_TOOLS_NO_EDIT` instead of `WORKER_TOOLS`.
+</ParamField>
+
+## Tool Sets by Role
+
+The `--role` flag determines which MCP tools are available to the agent:
+
+### Planner Tools (`PLANNER_TOOLS`)
+
+Full access for task planning and DAG creation:
+- File reading and writing tools
+- Task decomposition tools
+- DAG manipulation tools
+- Project introspection tools
+
+### Worker Tools (`WORKER_TOOLS`)
+
+Standard tools for task execution:
+- `read_text_file` (with hashline anchors for conflict detection)
+- `write_text_file` (verifies hashline anchors to detect stale edits)
+- `enki_worker_report` (signals completion and reports results)
+- Bash execution tools
+
+### Worker Tools (No Edit) (`WORKER_TOOLS_NO_EDIT`)
+
+Read-only subset for research roles:
+- `read_text_file`
+- `enki_worker_report`
+- File listing and search tools (no write/edit capabilities)
+
+### Merger Tools (`MERGER_TOOLS`)
+
+Minimal conflict resolution tools:
+- `read_text_file` (for inspecting conflict markers)
+- `write_text_file` (for resolving conflicts)
+- `enki_merger_done` (signals merge completion)
+
+Merger agents work in a shared temporary clone (kept alive via `CleanupGuard` + `std::mem::forget`).
+
+## Environment Variables
+
+### Required
+
+These variables are injected by the coordinator when spawning the MCP server:
+
+- **`ENKI_BIN`**: Path to the `enki` binary (for recursive invocations)
+- **`ENKI_DIR`**: Project `.enki/` directory for database and signal files
+- **`ENKI_SESSION_ID`**: Scopes MCP tool results to the current agent session
+
+### Modified
+
+- **`CLAUDECODE`**: Cleared on spawn to prevent nested-session refusal errors
+
+## Signal File IPC
+
+The MCP server communicates with the coordinator via signal files:
+
+- **Location**: `.enki/events/sig-*.json`
+- **Format**: JSON objects with event type and payload
+- **Polling**: Coordinator polls every 3 seconds and deletes processed signals
+- **No fsnotify**: Enki uses polling instead of filesystem notifications for simplicity
+
+Example signal file (`sig-1234567890.json`):
+
+```json
+{
+  "type": "WorkerDone",
+  "task_id": "task-42",
+  "status": "success",
+  "artifacts": ["output.md"]
+}
+```
+
+## Logging
+
+In MCP mode, logs go to stderr (not file):
+
+- **Log level**: `info` for `enki` module (configurable via `RUST_LOG`)
+- **Per-session logs**: `~/.enki/logs/sessions/<label>.log` (timestamped JSON-RPC request/response traffic)
+- **Debug logs include**: Subprocess args, prompt sizes, session kills
+
+## Exit Codes
+
+- **0**: Normal exit (agent session completed)
+- **1**: Error during MCP server initialization or runtime
+
+## Examples
+
+### Coordinator Spawning a Worker
+
+```bash
+# Internal invocation by the coordinator
+ENKI_BIN=/path/to/enki \
+ENKI_DIR=/project/.enki \
+ENKI_SESSION_ID=worker-task-42-1234567890 \
+enki mcp --role worker --task-id task-42
+```
+
+### Coordinator Spawning a Read-Only Researcher
+
+```bash
+# Worker with file editing disabled
+ENKI_BIN=/path/to/enki \
+ENKI_DIR=/project/.enki \
+ENKI_SESSION_ID=worker-task-7-research \
+enki mcp --role worker --task-id task-7 --no-edit
+```
+
+### Coordinator Spawning a Merger
+
+```bash
+# Merger agent for conflict resolution
+ENKI_BIN=/path/to/enki \
+ENKI_DIR=/project/.enki \
+ENKI_SESSION_ID=merger-conflict-1234567890 \
+enki mcp --role merger
+```
+
+### Manual Testing (Advanced)
+
+```bash
+# Manually start an MCP server for debugging
+# Send JSON-RPC requests via stdin, receive responses on stdout
+enki mcp --role worker --task-id test-task
+
+# Example JSON-RPC request (sent to stdin):
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/list"
+}
+```
+
+## Architecture Notes
+
+### Two-Phase Worker Completion
+
+1. **WorkerDone event**: Worker finishes and signals completion via `enki_worker_report` (frees tier slot immediately)
+2. **Merge phase**: Coordinator merges worker's changes back into main branch
+3. **MergeDone event**: Advances DAG and unblocks dependent tasks
+
+The scheduler tracks both phases separately for accurate concurrency accounting.
+
+### Hashline Anchors
+
+Workers receive file contents with hashline anchors:
+
+```
+  1:a3f2b8c9|fn main() {
+  2:d4e5f6a0|    println!("Hello, world!");
+  3:b1c2d3e4|}
+```
+
+Format: `{line_num:>width}:{xxh3_hash}|{content}`
+
+When writing back, `write_text_file` verifies the anchors to detect stale edits. If hashes don't match, the write is rejected and the coordinator may spawn a merger agent.
+
+### `!Send` Boundary
+
+All ACP agent state uses `Rc<RefCell<...>>` and is **not thread-safe**. The coordinator runs on a dedicated OS thread with:
+
+- `current_thread` tokio runtime (single-threaded async)
+- `LocalSet` for `!Send` futures
+
+Never attempt to send ACP types across threads.
+
+## Common Patterns
+
+### `process_events` Cascade
+
+Spawning a worker can fail and produce new events (e.g., `WorkerFailed`). The coordinator drains events in a loop:
+
+```rust
+while !events.is_empty() {
+    let new_events = orchestrator.process_events(events);
+    events = new_events;
+}
+```
+
+### `infra_broken` Flag
+
+If the copy manager (`cp`) fails during worker spawn, the coordinator sets an `infra_broken` flag and auto-fails all subsequent spawns without retrying.
+
+## See Also
+
+- [enki](/api/enki) - Launch the Enki TUI interface
+- [MCP Specification](https://spec.modelcontextprotocol.io/) - Model Context Protocol documentation

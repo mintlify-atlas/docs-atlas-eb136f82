@@ -1,0 +1,402 @@
+---
+title: MCP Tools
+description: Understand Enki's Model Context Protocol server, role-based tool filtering, and tool registry architecture.
+---
+
+Enki exposes its orchestration API to agents via the [Model Context Protocol (MCP)](https://spec.modelcontextprotocol.io/specification/2024-11-05/). Agents run as subprocesses calling back to the coordinator through MCP tools.
+
+## MCP Server Mode
+
+The `enki mcp` command starts a JSON-RPC stdio server implementing the MCP specification:
+
+```bash
+enki mcp --role worker --task-id task-01JXX...
+```
+
+**Usage:**
+- No args → Interactive TUI mode
+- `enki mcp` → MCP server mode (used by agent subprocesses)
+- Role and task ID are injected by the coordinator when spawning workers
+
+### Communication Flow
+
+```
+┌──────────────┐
+│  Coordinator │  (main enki process, manages orchestrator)
+└──────┬───────┘
+       │ spawns agent subprocess with ENKI_BIN env var
+       ▼
+┌──────────────┐
+│ Agent (ACP)  │  (claude-code or compatible client)
+└──────┬───────┘
+       │ talks to MCP server via stdio (JSON-RPC)
+       ▼
+┌──────────────┐
+│ enki mcp     │  (subprocess: enki mcp --role worker --task-id ...)
+└──────┬───────┘
+       │ writes signal files to .enki/events/sig-*.json
+       ▼
+┌──────────────┐
+│ Signal Files │  (IPC: coordinator polls every 3s)
+└──────────────┘
+```
+
+**Implementation:** `crates/cli/src/commands/mcp/mod.rs`
+
+1. Agent calls MCP tool (e.g., `enki_task_create`)
+2. `enki mcp` subprocess handles the tool call
+3. Tool writes a signal file to `.enki/events/sig-*.json`
+4. Coordinator polls signal files on 3s tick, deletes after processing
+5. Orchestrator updates state, spawns new workers, etc.
+
+<Warning>
+Agents do **not** get synchronous responses for state-changing operations. Tool calls return immediately with a confirmation message. The coordinator processes signal files asynchronously.
+</Warning>
+
+## Role-Based Tool Filtering
+
+Not all tools are available to all agents. Enki filters the tool list based on the agent's **role type** and **edit permissions**.
+
+### Tool Access Tiers
+
+Defined in `crates/cli/src/commands/mcp/mod.rs:11-56`:
+
+```rust
+const PLANNER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_create",
+    "enki_task_list",
+    "enki_task_retry",
+    "enki_execution_create",
+    "enki_pause",
+    "enki_cancel",
+    "enki_stop_all",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const WORKER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+    "enki_worker_report",
+    "enki_edit_file",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const WORKER_TOOLS_NO_EDIT: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+    "enki_worker_report",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const MERGER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+];
+```
+
+| Role Type | Tools | When Used |
+|-----------|-------|----------|
+| `planner` | Full orchestration tools | Coordinator agent (main TUI session) |
+| `worker` | Task execution tools + `enki_edit_file` (if `can_edit=true`) | Task workers spawned by orchestrator |
+| `worker` (no edit) | Task execution tools (no `enki_edit_file`) | Workers with `can_edit=false` in role config |
+| `merger` | Minimal (status, task list only) | Merge conflict resolution agents |
+
+### How Roles Map to Tool Tiers
+
+The `--role` flag passed to `enki mcp` determines tool access:
+
+```rust crates/cli/src/commands/mcp/mod.rs:58-71
+fn tools_for_role(role: &str, no_edit: bool) -> &'static [&'static str] {
+    match role {
+        "planner" => PLANNER_TOOLS,
+        "worker" => {
+            if no_edit {
+                WORKER_TOOLS_NO_EDIT
+            } else {
+                WORKER_TOOLS
+            }
+        }
+        "merger" => MERGER_TOOLS,
+        _ => &[],
+    }
+}
+```
+
+- **Coordinator spawns itself with `--role planner`** for the main TUI session
+- **Workers are spawned with `--role worker --task-id <id>`**
+- **`--no-edit` flag is set if the worker's role config has `can_edit = false`**
+- **Merger agents are spawned with `--role merger`** for conflict resolution
+
+### Custom Role Tool Access
+
+When you create a [custom role](/advanced/custom-roles), the `can_edit` field controls tool access:
+
+```toml .enki/roles/researcher.toml
+name = "researcher"
+label = "Researcher"
+can_edit = false  # ← Worker spawned with --no-edit, no enki_edit_file tool
+output = "artifact"
+system_prompt = "..."
+```
+
+<Tip>
+Use `can_edit = false` for read-only roles (research, audit, review). The agent won't have `enki_edit_file` in its tool list.
+</Tip>
+
+## Tool Registry
+
+All tool definitions are registered in `crates/cli/src/commands/mcp/tools.rs:3-392`.
+
+### Tool Definition Format
+
+Tools follow the MCP JSON Schema format:
+
+```rust
+json!({
+    "name": "enki_task_create",
+    "description": "Create a single standalone task. Starts with status 'ready'...",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "title": {
+                "type": "string",
+                "description": "Short task title."
+            },
+            "description": {
+                "type": "string",
+                "description": "Detailed task description with acceptance criteria."
+            },
+            "tier": {
+                "type": "string",
+                "enum": ["light", "standard", "heavy"],
+                "description": "Complexity tier. Defaults to 'standard'."
+            }
+        },
+        "required": ["title"]
+    }
+})
+```
+
+### Tool Handlers
+
+Tool implementations live in `crates/cli/src/commands/mcp/handlers.rs`:
+
+```rust
+pub(super) fn tool_task_create(args: &Value) -> Result<String, String> {
+    let title = args["title"].as_str().ok_or("missing required parameter: title")?;
+    let description = args["description"].as_str().map(String::from);
+    let tier_str = args["tier"].as_str().unwrap_or("heavy");
+
+    // Create task in DB
+    let db = open_db().map_err(|e| e.to_string())?;
+    let task = Task { /* ... */ };
+    db.insert_task(&task).map_err(|e| e.to_string())?;
+
+    // Write signal file for coordinator to pick up
+    write_signal_file(&json!({
+        "type": "task_created",
+        "task_id": task.id.as_str()
+    }))?;
+
+    Ok(format!("Created task '{}' ({}) — status: ready", title, task.id.short()))
+}
+```
+
+**Handler pattern:**
+1. Parse and validate arguments
+2. Perform the operation (write to DB, compute result, etc.)
+3. Write a signal file if the operation changes orchestrator state
+4. Return a human-readable confirmation message
+
+## Signal File IPC
+
+MCP tools use signal files for async communication with the coordinator. See [Signal Files](/advanced/signal-files) for details.
+
+## MCP Endpoints
+
+The MCP server implements four JSON-RPC methods:
+
+### initialize
+
+**Request:**
+```json
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+```
+
+**Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": {"tools": {}},
+    "serverInfo": {"name": "enki", "version": "..."}
+  }
+}
+```
+
+### notifications/initialized
+
+No response. Acknowledges initialization complete.
+
+### tools/list
+
+**Request:**
+```json
+{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+```
+
+**Response:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {"name": "enki_status", "description": "...", "inputSchema": {...}},
+      {"name": "enki_task_list", "description": "...", "inputSchema": {...}},
+      ...
+    ]
+  }
+}
+```
+
+Filtered by role and `no_edit` flag.
+
+### tools/call
+
+**Request:**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "enki_task_create",
+    "arguments": {"title": "Fix login bug", "tier": "standard"}
+  }
+}
+```
+
+**Response (success):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [{"type": "text", "text": "Created task 'Fix login bug' (a1b2) — status: ready, tier: standard"}]
+  }
+}
+```
+
+**Response (error):**
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [{"type": "text", "text": "tool 'enki_task_create' is not available for role 'merger'"}],
+    "isError": true
+  }
+}
+```
+
+## Environment Variables
+
+The MCP server and tool handlers rely on these environment variables (set by the coordinator when spawning agents):
+
+| Variable | Purpose |
+|----------|----------|
+| `ENKI_BIN` | Path to the enki binary (used to spawn `enki mcp` subprocesses) |
+| `ENKI_DIR` | Path to `.enki/` directory (DB location, signal files) |
+| `ENKI_SESSION_ID` | Scopes tool results to the current session |
+| `CLAUDECODE` | Cleared when spawning agents to prevent nested-session refusal |
+
+## Adding Custom Tools
+
+To add a new MCP tool:
+
+1. **Define the tool** in `crates/cli/src/commands/mcp/tools.rs`:
+
+```rust
+json!({
+    "name": "enki_my_tool",
+    "description": "Does something useful",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "param": {"type": "string", "description": "A parameter"}
+        },
+        "required": ["param"]
+    }
+})
+```
+
+2. **Add to the appropriate tool tier** in `mod.rs`:
+
+```rust
+const WORKER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_my_tool",  // ← Add here
+    // ...
+];
+```
+
+3. **Implement the handler** in `crates/cli/src/commands/mcp/handlers.rs`:
+
+```rust
+pub(super) fn tool_my_tool(args: &Value) -> Result<String, String> {
+    let param = args["param"].as_str().ok_or("missing required parameter: param")?;
+    // Do the thing
+    Ok(format!("Success: {}", param))
+}
+```
+
+4. **Wire it up** in `mod.rs` `handle_tools_call` function:
+
+```rust
+let result = match tool_name {
+    "enki_status" => tool_status(),
+    "enki_my_tool" => tool_my_tool(args),  // ← Add here
+    // ...
+    _ => Err(format!("unknown tool: {tool_name}")),
+};
+```
+
+<Warning>
+Custom tools are **not** part of the stable API. Enki is in active development. Tool signatures and behavior may change.
+</Warning>
+
+## Debugging
+
+To see MCP traffic:
+
+```bash
+# Per-agent session logs (timestamped JSON-RPC messages)
+tail -f ~/.enki/logs/sessions/<task-label>.log
+```
+
+Each log entry shows:
+- Timestamp
+- Direction (→ request, ← response)
+- Method name
+- Full JSON payload
+
+See [Architecture](/concepts/architecture) for more on logging.

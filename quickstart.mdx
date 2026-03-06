@@ -1,80 +1,256 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get up and running with Enki in minutes by creating your first multi-agent coding workflow
 ---
 
-## Get started in three steps
+## Your First Enki Session
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide walks you through launching Enki, understanding the initial setup, and creating your first task.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+Make sure you've completed the [Installation](/installation) steps before proceeding.
 </Note>
+
+## Launch the TUI
+
+Navigate to any project directory (Git repository or not) and run:
+
+```bash
+enki
+```
+
+This opens Enki's terminal user interface (TUI).
+
+### First Run: Project Initialization
+
+On first run in a new directory, Enki automatically:
+
+<Steps>
+  <Step title="Creates the .enki directory">
+    Initializes the project structure:
+    ```
+    .enki/
+    ├── db.sqlite          # Task and execution state
+    ├── events/            # Signal files for IPC
+    └── logs/
+        └── enki.log       # Session logs
+    ```
+  </Step>
+
+  <Step title="Initializes the database">
+    Creates SQLite tables for tasks, executions, merge requests, and worker state.
+  </Step>
+
+  <Step title="Starts the coordinator">
+    Launches the orchestration engine that manages agent processes and the task DAG.
+  </Step>
+</Steps>
+
+You'll see a chat interface ready to accept your instructions.
+
+## Understanding the Interface
+
+The TUI consists of:
+
+- **Chat Area**: Main interaction space where you describe work and see responses
+- **Task Status**: Visual indicators showing running, completed, and failed tasks
+- **Streaming Output**: Live updates from agents as they work
+
+## Create Your First Task
+
+Enki uses a coordinator agent to break down your requests into executable tasks. Let's try a simple example:
+
+### Example: Code Documentation
+
+In the TUI chat, type:
+
+```
+Add documentation comments to all public functions in src/main.rs
+```
+
+Press Enter to submit.
+
+### What Happens Next
+
+<Steps>
+  <Step title="Coordinator analyzes your request">
+    The coordinator agent (running via Claude Code) analyzes your instruction and decides how to break it into tasks.
+  </Step>
+
+  <Step title="Tasks are created">
+    The coordinator creates one or more tasks with dependencies. For this example, likely a single task:
+    - "Document public functions in src/main.rs"
+  </Step>
+
+  <Step title="Workers are spawned">
+    For each task, Enki:
+    - Creates a copy-on-write clone of your project at `.enki/copies/<task-id>/`
+    - Spawns an ACP agent in that isolated copy
+    - The agent works independently without affecting your main files
+  </Step>
+
+  <Step title="Work is merged back">
+    When a worker completes:
+    - Changes are committed to a branch in the copy
+    - The branch is fetched back to your main repository
+    - Changes are merged through Enki's merge queue
+    - You see the updates in your working directory
+  </Step>
+</Steps>
+
+### Real Terminal Output
+
+Here's what you might see:
+
+```
+[You]: Add documentation comments to all public functions in src/main.rs
+
+[Coordinator]: I'll create a task to add documentation to your public functions.
+
+✓ Task created: Document public functions in src/main.rs
+⚙ Spawning worker (standard tier)...
+⚙ Worker started in copy: .enki/copies/task-a1b2c3d4/
+
+[Worker task-a1b2c3d4]: Reading src/main.rs...
+[Worker task-a1b2c3d4]: Found 3 public functions to document
+[Worker task-a1b2c3d4]: Adding doc comments...
+[Worker task-a1b2c3d4]: ✓ Documentation complete
+
+✓ Worker completed
+⚙ Merging changes from branch task/a1b2c3d4...
+✓ Merge successful
+
+[Coordinator]: Documentation has been added to all public functions in src/main.rs.
+```
+
+## Multi-Step Workflows
+
+Enki excels at complex, multi-step work with dependencies. Try:
+
+```
+Add a new CLI command 'enki doctor' that checks system requirements,
+then write tests for it, and finally add documentation
+```
+
+The coordinator will:
+1. Create a dependency graph (DAG)
+2. Implement the command first
+3. After implementation completes, run tests and documentation in parallel
+4. Merge changes in order
+
+### Parallel Execution
+
+Enki runs independent tasks in parallel based on tier limits:
+
+- **Light tier**: Up to 5 concurrent workers (simple tasks)
+- **Standard tier**: Up to 3 concurrent workers (typical coding tasks)
+- **Heavy tier**: 1 worker at a time (complex refactors)
+
+## Working in Git Repositories
+
+If your project is a Git repository, Enki:
+
+- Creates a `task/<id>` branch for each task
+- Commits worker output to that branch
+- Merges through a queue to avoid conflicts
+- Preserves your Git history with structured commits
+
+<Note>
+In non-Git directories, Enki uses Git internally for tracking changes but doesn't create a permanent repository.
+</Note>
+
+## Common Commands in the TUI
+
+While chatting with the coordinator, you can:
+
+- **Create tasks**: Describe work naturally
+- **Check status**: "What tasks are running?"
+- **Pause work**: "Pause the refactoring task"
+- **Cancel tasks**: "Cancel all pending documentation tasks"
+- **Retry failures**: "Retry the failed test task"
+- **Stop everything**: "Stop all workers"
+
+## Coordinator Agent Behavior
+
+<Warning>
+The coordinator agent works directly in your main project directory, not in isolated copies. When it edits code, changes appear immediately in your working directory without automatic commits.
+</Warning>
+
+Worker agents, on the other hand, work in isolated copies and their changes are merged through the queue.
+
+## Checking Logs
+
+If something goes wrong, check the logs:
+
+```bash
+# View the end of the most recent session
+tail -n 200 ~/.enki/logs/enki.log
+
+# Find errors and warnings
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+
+# Per-agent session logs (timestamped JSON-RPC traffic)
+ls ~/.enki/logs/sessions/
+```
+
+Log files use this format:
+```
+══════════════════ SESSION START ══════════════════
+[timestamp] INFO Starting coordinator...
+[timestamp] DEBUG Spawning worker for task-abc123
+```
+
+## Tips for Success
+
+1. **Be specific**: The more detail you provide, the better the coordinator can plan
+2. **Use natural language**: Describe tasks as you would to a colleague
+3. **Check status frequently**: Use "show status" to see what's running
+4. **Let it work**: Agents work in isolated copies, so your main code stays safe
+5. **Review merges**: Check merged changes before committing to your main branch
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Learn how Enki's DAG orchestration works
+  </Card>
+  
+  <Card title="Task Management" icon="list-check" href="/usage/creating-tasks">
+    Master creating, managing, and monitoring tasks
+  </Card>
+  
+  <Card title="Merge Queue" icon="code-merge" href="/concepts/merge-queue">
+    Understand how changes are merged back
+  </Card>
+  
+  <Card title="Troubleshooting" icon="wrench" href="/troubleshooting/common-issues">
+    Solutions for common issues
+  </Card>
+</CardGroup>
+
+## Example Workflows
+
+Here are some real-world examples to try:
+
+### Refactoring
+```
+Refactor the database module to use async/await,
+update all call sites, and ensure tests pass
+```
+
+### Feature Addition
+```
+Add a new API endpoint for user preferences,
+include validation and error handling,
+write integration tests,
+and add OpenAPI documentation
+```
+
+### Bug Fix
+```
+Fix the memory leak in the connection pool,
+add a test that reproduces the issue,
+and document the fix in CHANGELOG.md
+```
+
+Each of these will result in multiple parallel tasks with automatic dependency resolution.

@@ -1,0 +1,490 @@
+---
+title: enki-core
+description: Pure sync orchestrator and DAG scheduler
+---
+
+# enki-core
+
+Pure sync state machine. Zero async, zero tokio. Orchestrator, DAG scheduler, SQLite persistence, CoW copy manager, git merge refinery, roles, hashlines.
+
+<Note>
+**Design principle:** All operations are synchronous. The orchestrator processes commands and returns events — no spawning, no async I/O. The runtime layer (CLI) handles async execution.
+</Note>
+
+## Core Modules
+
+### orchestrator
+
+The main state machine. Processes commands, updates the DAG, and returns events.
+
+#### Orchestrator
+
+```rust
+pub struct Orchestrator {
+    scheduler: Scheduler,
+    db: Db,
+    monitor: MonitorState,
+    events_dir: Option<PathBuf>,
+    session_id: String,
+}
+
+impl Orchestrator {
+    pub fn new(db: Db, limits: Limits, session_id: String) -> Self
+    pub fn session_id(&self) -> &str
+    pub fn set_events_dir(&mut self, path: PathBuf)
+    pub fn db(&self) -> &Db
+    pub fn scheduler(&self) -> &Scheduler
+    
+    /// Process a command and return events for the CLI layer.
+    pub fn handle(&mut self, cmd: Command) -> Vec<Event>
+    
+    pub fn set_step_session(&mut self, execution_id: &str, step_id: &str, session_id: String)
+    pub fn session_ended(&mut self, session_id: &str)
+    pub fn worker_counts(&self) -> (usize, usize, usize, usize)
+    pub fn running_steps(&self) -> Vec<(String, String, Id)>
+    pub fn reconcile_merges(&mut self) -> Vec<Event>
+}
+```
+
+**Usage:**
+
+```rust
+let db = Db::open(".enki/db.sqlite")?;
+let limits = Limits::default();
+let mut orch = Orchestrator::new(db, limits, "session-abc123".into());
+
+// CLI sends commands
+let events = orch.handle(Command::CreateTask {
+    title: "Fix auth bug".into(),
+    description: Some("User login fails on Safari".into()),
+    tier: Tier::Standard,
+});
+
+// CLI executes events
+for event in events {
+    match event {
+        Event::SpawnWorker { task_id, .. } => { /* spawn ACP agent */ }
+        Event::QueueMerge(mr) => { /* launch refinery */ }
+        _ => {}
+    }
+}
+```
+
+#### Command
+
+Input commands from the runtime:
+
+```rust
+pub enum Command {
+    CreateExecution { steps: Vec<StepDef> },
+    CreateTask { title: String, description: Option<String>, tier: Tier },
+    WorkerDone(WorkerResult),
+    MergeDone(MergeResult),
+    RetryTask { task_id: Id },
+    Pause(Target),
+    Resume(Target),
+    Cancel(Target),
+    StopAll,
+    MonitorTick { workers: Vec<(String, String, Instant)> },
+    DiscoverFromDb,
+    AddSteps { execution_id: Id, steps: Vec<StepDef> },
+    CheckSignals,
+}
+```
+
+#### Event
+
+Output events for the runtime to execute:
+
+```rust
+pub enum Event {
+    SpawnWorker {
+        task_id: Id,
+        title: String,
+        description: String,
+        tier: Tier,
+        execution_id: Id,
+        step_id: String,
+        upstream_outputs: Vec<(String, String)>,
+        role: Option<String>,
+    },
+    KillSession { session_id: String },
+    QueueMerge(MergeRequest),
+    WorkerCompleted { task_id: String, title: String },
+    WorkerFailed { task_id: String, title: String, error: String },
+    MergeLanded { mr_id: String, task_id: String, branch: String },
+    MergeConflicted { mr_id: String, task_id: String, branch: String },
+    MergeNeedsResolution {
+        mr_id: String,
+        task_id: Id,
+        temp_dir: PathBuf,
+        default_branch: String,
+        conflict_files: Vec<String>,
+        conflict_diff: String,
+    },
+    MergeFailed { mr_id: String, task_id: String, branch: String, reason: String },
+    ExecutionComplete { execution_id: String },
+    ExecutionFailed { execution_id: String },
+    CheckpointReached { execution_id: String, step_id: String, title: String, output: Option<String> },
+    // ... more variants
+}
+```
+
+#### WorkerResult & MergeResult
+
+Reported by the runtime after workers/merges finish:
+
+```rust
+pub struct WorkerResult {
+    pub task_id: Id,
+    pub execution_id: Option<Id>,
+    pub step_id: Option<String>,
+    pub title: String,
+    pub branch: String,
+    pub outcome: WorkerOutcome,
+}
+
+pub enum WorkerOutcome {
+    Success { output: Option<String> },
+    Artifact { output: Option<String> },
+    NoChanges,
+    Failed { error: String },
+}
+
+pub struct MergeResult {
+    pub mr_id: Id,
+    pub outcome: MergeOutcome,
+}
+```
+
+### scheduler
+
+Concurrency manager. Enforces tier limits, dispatches ready tasks, tracks running workers.
+
+```rust
+pub struct Scheduler {
+    limits: Limits,
+    executions: HashMap<String, ExecutionState>,
+    running: TierCounts,
+}
+
+pub struct Limits {
+    pub max_workers: usize,
+    pub max_heavy: usize,
+    pub max_standard: usize,
+    pub max_light: usize,
+}
+
+impl Scheduler {
+    pub fn new(limits: Limits) -> Self
+    pub fn add_execution(&mut self, execution_id: Id, project_id: Id, dag: Dag, step_tasks: HashMap<String, Id>)
+    
+    /// One scheduling pass. Returns actions for the runtime to execute.
+    pub fn tick(&mut self) -> Vec<SchedulerAction>
+    
+    /// Two-phase completion: worker finishes (frees tier slot) ...
+    pub fn step_worker_done(&mut self, execution_id: &str, step_id: &str, output: Option<String>)
+    /// ... then merge lands (fires Merged edges)
+    pub fn step_completed(&mut self, execution_id: &str, step_id: &str, output: Option<String>)
+    
+    pub fn step_failed(&mut self, execution_id: &str, step_id: &str)
+    pub fn retry_node(&mut self, execution_id: &str, step_id: &str) -> bool
+    pub fn pause_execution(&mut self, execution_id: &str) -> bool
+    pub fn resume_execution(&mut self, execution_id: &str) -> bool
+    pub fn cancel_execution(&mut self, execution_id: &str) -> Vec<(Id, String)>
+    pub fn worker_counts(&self) -> (usize, usize, usize, usize)
+}
+
+pub enum SchedulerAction {
+    SpawnWorker {
+        task_id: Id,
+        project_id: Id,
+        title: String,
+        description: String,
+        tier: Tier,
+        execution_id: Id,
+        step_id: String,
+        upstream_outputs: Vec<(String, String)>,
+        role: Option<String>,
+    },
+    TaskBlocked { task_id: Id, execution_id: Id, step_id: String },
+    ExecutionComplete { execution_id: Id },
+    ExecutionFailed { execution_id: Id },
+}
+```
+
+**Key pattern:** `step_worker_done()` decrements the tier count (worker process exits). Later, `step_completed()` advances the DAG (merge landed). This two-phase design allows dependents with `Completed` edges to start before the merge finishes.
+
+### dag
+
+Directed acyclic graph with node status tracking and edge conditions.
+
+```rust
+pub struct Dag {
+    nodes: Vec<Node>,
+    index: HashMap<String, usize>,
+}
+
+pub struct Node {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub tier: Option<Tier>,
+    pub status: NodeStatus,
+    pub checkpoint: bool,
+    pub role: Option<String>,
+    pub deps: Vec<Edge>,
+    pub dependents: Vec<usize>,
+}
+
+pub struct Edge {
+    pub target: usize,
+    pub condition: EdgeCondition,
+}
+
+pub enum EdgeCondition {
+    Merged,    // Dep's merge must have landed (status == Done)
+    Completed, // Dep's worker finished (status == WorkerDone or Done)
+    Started,   // Dep just started running (status == Running, WorkerDone, or Done)
+}
+
+pub enum NodeStatus {
+    Pending,
+    Ready,
+    Running,
+    WorkerDone, // Worker finished, merge pending
+    Done,       // Merge landed
+    Failed,
+    Blocked,
+    Paused,
+    Cancelled,
+}
+
+impl Dag {
+    pub fn single(step_id: &str, title: &str, description: &str, tier: Option<Tier>) -> Self
+    pub fn from_steps(steps: &[(String, String, String, Option<Tier>, Vec<String>)]) -> Self
+    pub fn from_steps_with_edges(steps: &[(String, String, String, Option<Tier>, bool, Option<String>, Vec<(String, EdgeCondition)>)]) -> Self
+    pub fn add_steps(&mut self, steps: &[...]) -> Result<(), String>
+    
+    pub fn get(&self, id: &str) -> Option<&Node>
+    pub fn nodes(&self) -> &[Node]
+    pub fn ready_nodes(&self) -> Vec<&str>
+    pub fn blocked_nodes(&self) -> Vec<&str>
+    
+    pub fn mark_running(&mut self, id: &str) -> bool
+    pub fn mark_worker_done(&mut self, id: &str) -> bool
+    pub fn mark_done(&mut self, id: &str) -> bool
+    pub fn mark_failed(&mut self, id: &str) -> bool
+    
+    pub fn pause_node(&mut self, id: &str) -> Option<bool>
+    pub fn resume_node(&mut self, id: &str) -> bool
+    pub fn retry_node(&mut self, id: &str) -> bool
+    pub fn cancel_node(&mut self, id: &str) -> Option<bool>
+    
+    pub fn is_complete(&self) -> bool
+    pub fn has_failures(&self) -> bool
+}
+```
+
+**Edge conditions example:**
+
+```rust
+// Design → Implement (must wait for merge)
+Dag::from_steps_with_edges(&[
+    ("design".into(), "Design".into(), "...".into(), Some(Tier::Heavy), false, None, vec![]),
+    ("implement".into(), "Implement".into(), "...".into(), Some(Tier::Standard), false, None, 
+        vec![("design".into(), EdgeCondition::Merged)]),
+    // Test can start as soon as design worker finishes (no need to wait for merge)
+    ("test".into(), "Test".into(), "...".into(), Some(Tier::Light), false, None, 
+        vec![("design".into(), EdgeCondition::Completed)]),
+]);
+```
+
+### types
+
+Core domain types used throughout the system.
+
+```rust
+pub struct Id(pub String);
+
+impl Id {
+    pub fn new(prefix: &str) -> Self  // "task-a1b2c3d4"
+    pub fn short(&self) -> &str       // "a1b2"
+    pub fn as_str(&self) -> &str
+}
+
+pub enum TaskStatus { Pending, Running, Done, Failed, Blocked, Paused, Cancelled, Abandoned }
+pub enum Tier { Light, Standard, Heavy }
+pub enum MergeStatus { Queued, Processing, Rebasing, Resolving, Verifying, Merged, Conflicted, Failed }
+pub enum ExecutionStatus { Running, Done, Failed, Aborted, Paused }
+
+pub struct Task {
+    pub id: Id,
+    pub session_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    pub assigned_to: Option<Id>,
+    pub copy_path: Option<String>,
+    pub branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub tier: Option<Tier>,
+    pub current_activity: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub struct Execution {
+    pub id: Id,
+    pub session_id: Option<String>,
+    pub status: ExecutionStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+pub struct MergeRequest {
+    pub id: Id,
+    pub task_id: Id,
+    pub branch: String,
+    pub base_branch: String,
+    pub status: MergeStatus,
+    pub priority: i32,
+    pub diff_stats: Option<serde_json::Value>,
+    pub review_note: Option<String>,
+    pub execution_id: Option<Id>,
+    pub step_id: Option<String>,
+    pub queued_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub merged_at: Option<DateTime<Utc>>,
+}
+```
+
+## Other Modules
+
+### db
+
+SQLite persistence layer (WAL mode). Schema auto-migrates on startup.
+
+```rust
+pub struct Db { /* ... */ }
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Self>
+    pub fn open_in_memory() -> Result<Self>
+    
+    pub fn insert_task(&self, task: &Task) -> Result<()>
+    pub fn get_task(&self, id: &Id) -> Result<Task>
+    pub fn update_task_status(&self, id: &Id, status: TaskStatus) -> Result<()>
+    pub fn list_tasks(&self) -> Result<Vec<Task>>
+    
+    pub fn insert_execution(&self, exec: &Execution) -> Result<()>
+    pub fn get_running_executions(&self, session_id: Option<&str>) -> Result<Vec<Execution>>
+    
+    pub fn save_dag(&self, execution_id: &Id, dag: &Dag) -> Result<()>
+    pub fn load_dag(&self, execution_id: &Id) -> Result<Option<Dag>>
+    
+    // ... many more methods
+}
+```
+
+### copy
+
+CoW copy manager using `cp -Rc` (macOS) or `cp --reflink=auto -a` (Linux).
+
+```rust
+pub struct CopyManager {
+    base_path: PathBuf,
+}
+
+impl CopyManager {
+    pub fn new(base_path: PathBuf) -> Self
+    pub fn make_copy(&self, prefix: &str) -> Result<PathBuf>
+}
+```
+
+### refinery
+
+Git merge automation. Rebases worker branches onto the default branch, runs `verify.sh` if present.
+
+```rust
+pub enum MergeOutcome {
+    Merged,
+    Conflicted(String),
+    NeedsResolution { temp_dir: PathBuf, conflict_files: Vec<String>, conflict_diff: String },
+    VerifyFailed(String),
+    Failed(String),
+}
+
+pub fn merge_branch(...) -> Result<MergeOutcome>
+```
+
+### hashline
+
+Line-anchored file editing. Each line is tagged with `{line_num:>width}:{xxh3_hash}|{content}`. Edits verify anchors to detect stale modifications.
+
+```rust
+pub fn read_text_file(path: &Path) -> Result<String>
+pub fn write_text_file(path: &Path, content: &str) -> Result<()>
+```
+
+### roles
+
+Agent role configuration cascade: builtins → `~/.enki/roles/*.toml` → `.enki/roles/*.toml`.
+
+```rust
+pub struct RoleConfig {
+    pub instructions: String,
+    pub model_tier: Option<Tier>,
+}
+
+pub fn load_roles(project_dir: &Path) -> HashMap<String, RoleConfig>
+```
+
+## Full Workflow Example
+
+```rust
+// 1. CLI initializes orchestrator
+let db = Db::open(".enki/db.sqlite")?;
+let mut orch = Orchestrator::new(db, Limits::default(), session_id);
+
+// 2. CLI sends CreateTask command
+let events = orch.handle(Command::CreateTask {
+    title: "Add rate limiting".into(),
+    description: Some("Prevent API abuse".into()),
+    tier: Tier::Standard,
+});
+
+// 3. Orchestrator returns SpawnWorker event
+match &events[0] {
+    Event::SpawnWorker { task_id, execution_id, step_id, tier, .. } => {
+        // CLI spawns ACP agent via enki-acp
+        let session_id = mgr.start_session("claude", &["--acp"], copy_path).await?;
+        orch.set_step_session(execution_id, step_id, session_id);
+        mgr.prompt(&session_id, "Add rate limiting to the API").await?;
+    }
+    _ => {}
+}
+
+// 4. Worker finishes, CLI reports back
+let events = orch.handle(Command::WorkerDone(WorkerResult {
+    task_id,
+    execution_id: Some(exec_id),
+    step_id: Some(step_id),
+    title: "Add rate limiting".into(),
+    branch: "task/rate-limit".into(),
+    outcome: WorkerOutcome::Success { output: Some("Added Redis-based rate limiter".into()) },
+}));
+
+// 5. Orchestrator queues merge
+match &events[1] {
+    Event::QueueMerge(mr) => {
+        // CLI runs refinery
+        let outcome = merge_branch(repo_path, &mr.branch, &mr.base_branch)?;
+        orch.handle(Command::MergeDone(MergeResult { mr_id: mr.id.clone(), outcome }));
+    }
+    _ => {}
+}
+
+// 6. Scheduler ticks again, execution completes
+let events = orch.handle(Command::DiscoverFromDb);
+assert!(events.iter().any(|e| matches!(e, Event::ExecutionComplete { .. })));
+```

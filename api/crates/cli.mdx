@@ -1,0 +1,534 @@
+---
+title: enki CLI
+description: Main binary and coordinator loop
+---
+
+# enki CLI
+
+The `enki` binary. No args → TUI. `enki mcp` → JSON-RPC stdio server. Houses the coordinator loop (`tokio::select!` on a dedicated OS thread with `current_thread` runtime + `LocalSet`).
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Main Thread (TUI)                                           │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ Chat::run()                                          │  │
+│  │  - Render canvas                                     │  │
+│  │  - Handle input                                      │  │
+│  │  - Poll coordinator channel                          │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                            ↕ mpsc channels
+┌─────────────────────────────────────────────────────────────┐
+│ Coordinator Thread (OS thread)                              │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ current_thread runtime + LocalSet                    │  │
+│  │  ┌────────────────────────────────────────────────┐  │  │
+│  │  │ coordinator_loop()                             │  │  │
+│  │  │  tokio::select! {                              │  │  │
+│  │  │    - to_coord_rx.recv()                        │  │  │
+│  │  │    - worker_done_rx.recv()                     │  │  │
+│  │  │    - merger_done_rx.recv()                     │  │  │
+│  │  │    - 3s tick                                   │  │  │
+│  │  │  }                                             │  │  │
+│  │  │  ┌──────────────────────────────────────────┐  │  │  │
+│  │  │  │ AgentManager (Rc<RefCell<...>>, !Send)  │  │  │  │
+│  │  │  │  - spawn_session()                       │  │  │  │
+│  │  │  │  - prompt()                              │  │  │  │
+│  │  │  │  - kill_session()                        │  │  │  │
+│  │  │  └──────────────────────────────────────────┘  │  │  │
+│  │  │  ┌──────────────────────────────────────────┐  │  │  │
+│  │  │  │ Orchestrator (pure sync)                 │  │  │  │
+│  │  │  │  - handle(Command) → Vec<Event>          │  │  │  │
+│  │  │  └──────────────────────────────────────────┘  │  │  │
+│  │  └────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Main Entry Point
+
+```rust
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    Mcp {
+        #[arg(long, default_value = "planner")]
+        role: String,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        no_edit: bool,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => {
+            // Launch TUI
+            commands::init().await?;
+            let db = commands::open_db()?;
+            tui::run(db, db_path, enki_bin).await
+        }
+        Some(Cmd::Mcp { role, task_id, no_edit }) => {
+            // Run MCP stdio server
+            commands::mcp::run(&role, task_id.as_deref(), no_edit)
+        }
+    }
+}
+```
+
+## Coordinator Module
+
+Located in `cli/src/tui/coordinator/`.
+
+### Spawning
+
+```rust
+pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHandle {
+    let (to_coord_tx, to_coord_rx) = mpsc::unbounded_channel::<ToCoordinator>();
+    let (from_coord_tx, from_coord_rx) = mpsc::unbounded_channel::<FromCoordinator>();
+    
+    std::thread::Builder::new()
+        .name("coordinator-acp".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            
+            rt.block_on(async {
+                let local = tokio::task::LocalSet::new();
+                local.run_until(coordinator_loop(cwd, db_path, enki_bin, to_coord_rx, from_coord_tx)).await;
+            });
+        })
+        .unwrap();
+    
+    CoordinatorHandle { tx: to_coord_tx, rx: from_coord_rx }
+}
+```
+
+**Why a dedicated thread?**
+
+1. ACP is `!Send` (uses `Rc<RefCell<...>>`)
+2. Must run on `LocalSet` (single-threaded async)
+3. Main thread is blocked by TUI event loop
+4. Solution: dedicated OS thread with `current_thread` runtime
+
+### Message Types
+
+```rust
+pub enum ToCoordinator {
+    Prompt(String),
+    Interrupt,
+    Shutdown,
+    StopAll,
+}
+
+pub enum FromCoordinator {
+    Connected,
+    Ready,
+    Text(String),
+    ToolCall(String),
+    ToolCallDone(String),
+    Done(String),
+    WorkerSpawned { task_id: String, title: String, tier: String },
+    WorkerCompleted { task_id: String, title: String },
+    WorkerFailed { task_id: String, title: String, error: String },
+    WorkerUpdate { task_id: String, activity: WorkerActivity },
+    MergeQueued { mr_id: String, task_id: String, branch: String },
+    MergeLanded { mr_id: String, task_id: String, branch: String },
+    MergeConflicted { mr_id: String, task_id: String, branch: String },
+    MergeFailed { mr_id: String, task_id: String, branch: String, reason: String },
+    WorkerReport { task_id: String, status: String },
+    AllStopped { count: usize },
+    WorkerCount(usize),
+    Interrupted,
+    Error(String),
+}
+```
+
+### Coordinator Loop
+
+The main event loop (simplified):
+
+```rust
+async fn coordinator_loop(
+    cwd: PathBuf,
+    db_path: String,
+    enki_bin: PathBuf,
+    mut to_coord_rx: mpsc::UnboundedReceiver<ToCoordinator>,
+    from_coord_tx: mpsc::UnboundedSender<FromCoordinator>,
+) {
+    let db = Db::open(&db_path).unwrap();
+    let mut orch = Orchestrator::new(db, Limits::default(), session_id);
+    let mgr = AgentManager::new();
+    let copy_mgr = CopyManager::new(cwd.clone());
+    
+    let (worker_done_tx, mut worker_done_rx) = mpsc::unbounded_channel();
+    let (merger_done_tx, mut merger_done_rx) = mpsc::unbounded_channel();
+    
+    // Set up AgentManager update callback
+    mgr.on_update(move |session_id, update| {
+        match update {
+            SessionUpdate::Text(t) => from_coord_tx.send(FromCoordinator::Text(t)).ok(),
+            SessionUpdate::ToolCallStarted { title, .. } => from_coord_tx.send(FromCoordinator::ToolCall(title)).ok(),
+            // ...
+        };
+    });
+    
+    let mut coord_session = CoordinatorSession::new();
+    let mut ticker = tokio::time::interval(Duration::from_secs(3));
+    
+    loop {
+        tokio::select! {
+            // TUI sends commands
+            Some(msg) = to_coord_rx.recv() => {
+                match msg {
+                    ToCoordinator::Prompt(text) => {
+                        handle_user_prompt(&mut orch, &mgr, &mut coord_session, text).await;
+                    }
+                    ToCoordinator::Interrupt => {
+                        coord_session.cancel();
+                        mgr.cancel(&coord_session.session_id).await.ok();
+                    }
+                    ToCoordinator::Shutdown => break,
+                    ToCoordinator::StopAll => {
+                        kill_all_workers(&mgr, &tracker);
+                        orch.handle(Command::StopAll);
+                    }
+                }
+            }
+            
+            // Worker finished
+            Some(done) = worker_done_rx.recv() => {
+                process_worker_done(&mut orch, &mut coord_session, done).await;
+            }
+            
+            // Merger finished
+            Some(done) = merger_done_rx.recv() => {
+                let events = orch.handle(Command::MergeDone(done.result));
+                process_events(&mut orch, &mgr, &copy_mgr, events).await;
+            }
+            
+            // Periodic tick (every 3s)
+            _ = ticker.tick() => {
+                poll_tick(&mut orch, &mut coord_session).await;
+            }
+        }
+    }
+}
+```
+
+### Key Functions
+
+#### process_events
+
+Translates orchestrator events into async runtime actions:
+
+```rust
+async fn process_events(
+    orch: &mut Orchestrator,
+    mgr: &AgentManager,
+    copy_mgr: &CopyManager,
+    events: Vec<Event>,
+) {
+    let mut queue = VecDeque::from(events);
+    
+    while let Some(event) = queue.pop_front() {
+        match event {
+            Event::SpawnWorker { task_id, title, tier, execution_id, step_id, role, .. } => {
+                // 1. Create copy
+                let copy_path = copy_mgr.make_copy(&task_id.0)?;
+                
+                // 2. Spawn ACP session
+                let session_id = mgr.start_session_with_mcp(
+                    "claude", &["--acp"], copy_path, mcp_servers, &task_id.0
+                ).await?;
+                
+                // 3. Register with orchestrator
+                orch.set_step_session(&execution_id.0, &step_id, session_id.clone());
+                
+                // 4. Build prompt
+                let prompt = build_worker_prompt(&title, upstream_outputs, role);
+                
+                // 5. Send prompt (don't await — runs in background)
+                tokio::task::spawn_local({
+                    let mgr = mgr.clone();
+                    let session_id = session_id.clone();
+                    let worker_done_tx = worker_done_tx.clone();
+                    async move {
+                        let result = mgr.prompt(&session_id, &prompt).await;
+                        let outcome = discover_worker_outcome(&copy_path, result);
+                        worker_done_tx.send(WorkerDone { task_id, outcome, .. }).ok();
+                    }
+                });
+                
+                from_coord_tx.send(FromCoordinator::WorkerSpawned { task_id: task_id.0, title, tier }).ok();
+            }
+            
+            Event::QueueMerge(mr) => {
+                try_dispatch_merge(mr, merger_done_tx.clone()).await;
+            }
+            
+            Event::KillSession { session_id } => {
+                mgr.kill_session(&session_id);
+            }
+            
+            // ... handle other events
+        }
+        
+        // Some events spawn new events (e.g., failed spawn → discover new tasks)
+        // Drain them in a cascade
+        let new_events = orch.handle(Command::CheckSignals);
+        queue.extend(new_events);
+    }
+}
+```
+
+### Worker Lifecycle
+
+```rust
+// 1. Orchestrator emits SpawnWorker
+Event::SpawnWorker { task_id, title, .. }
+
+// 2. Coordinator spawns ACP session
+let session_id = mgr.start_session(...).await?;
+
+// 3. Coordinator sends prompt (non-blocking)
+tokio::task::spawn_local(async move {
+    let result = mgr.prompt(&session_id, prompt).await;
+    worker_done_tx.send(WorkerDone { task_id, outcome }).ok();
+});
+
+// 4. Worker finishes, sends WorkerDone
+worker_done_rx.recv().await
+
+// 5. Coordinator reports to orchestrator
+orch.handle(Command::WorkerDone(WorkerResult { ... }))
+
+// 6. Orchestrator emits QueueMerge
+Event::QueueMerge(mr)
+
+// 7. Coordinator runs refinery
+try_dispatch_merge(mr, merger_done_tx).await
+
+// 8. Merger finishes, sends MergerDone
+merger_done_rx.recv().await
+
+// 9. Coordinator reports to orchestrator
+orch.handle(Command::MergeDone(MergeResult { ... }))
+
+// 10. Scheduler ticks, execution completes
+Event::ExecutionComplete { execution_id }
+```
+
+## MCP Server Mode
+
+When run as `enki mcp`, the binary acts as a JSON-RPC stdio server for ACP agents.
+
+### Tool Categories
+
+Different roles expose different tool sets:
+
+```rust
+pub const PLANNER_TOOLS: &[&str] = &[
+    "enki_create_execution",
+    "enki_add_steps",
+    "enki_create_task",
+    "enki_pause",
+    "enki_resume",
+    "enki_cancel",
+    "enki_list_tasks",
+    "enki_mail",
+    "enki_read_inbox",
+    // ... all tools
+];
+
+pub const WORKER_TOOLS: &[&str] = &[
+    "enki_worker_report",
+    "enki_task_output",
+    "read_text_file",
+    "write_text_file",
+    "terminal",
+];
+
+pub const WORKER_TOOLS_NO_EDIT: &[&str] = &[
+    "enki_worker_report",
+    "enki_task_output",
+    "read_text_file",
+    // no write_text_file
+];
+
+pub const MERGER_TOOLS: &[&str] = &[
+    "read_text_file",
+    "write_text_file",
+    "terminal",
+];
+```
+
+### Key Tools
+
+#### enki_create_execution
+
+Creates a multi-step execution:
+
+```json
+{
+  "steps": [
+    {
+      "id": "design",
+      "title": "Design auth system",
+      "description": "Research and design",
+      "tier": "heavy",
+      "needs": []
+    },
+    {
+      "id": "implement",
+      "title": "Implement auth",
+      "tier": "standard",
+      "needs": [{ "step_id": "design", "condition": "merged" }]
+    }
+  ]
+}
+```
+
+#### enki_worker_report
+
+Worker reports its current activity (for TUI display):
+
+```json
+{
+  "task_id": "task-abc123",
+  "status": "Refactoring auth.rs"
+}
+```
+
+#### read_text_file / write_text_file
+
+Hashline-anchored file editing (see `core::hashline`).
+
+### Signal File IPC
+
+External MCP calls write `.enki/events/sig-*.json` files:
+
+```json
+{"type": "execution_created", "execution_id": "exec-abc123"}
+{"type": "task_created", "task_id": "task-def456"}
+{"type": "pause", "execution_id": "exec-abc123", "step_id": "implement"}
+{"type": "stop_all"}
+```
+
+Coordinator polls every 3s, processes signals, then deletes files.
+
+## Commands Module
+
+Utility commands in `cli/src/commands/`.
+
+```rust
+pub fn init() -> Result<()>         // Create .enki/ directory
+pub fn db_path() -> Result<PathBuf> // Resolve .enki/db.sqlite
+pub fn open_db() -> Result<Db>      // Open database
+pub fn global_dir() -> PathBuf      // ~/.enki
+```
+
+## Environment Variables
+
+| Var | Purpose |
+|-----|----------|
+| `ENKI_BIN` | Path to own binary (injected into all subprocesses) |
+| `ENKI_DIR` | Project `.enki/` directory for DB + signal files |
+| `ENKI_SESSION_ID` | Scopes MCP tool results to current session |
+| `CLAUDECODE` | Cleared on agent spawn to prevent nested-session refusal |
+
+## Logging
+
+TUI mode logs to `~/.enki/logs/enki.log`. MCP mode logs to stderr.
+
+```rust
+fn init_logging(is_tui: bool) -> Option<WorkerGuard> {
+    if is_tui {
+        let log_dir = commands::global_dir().join("logs");
+        let file_appender = tracing_appender::rolling::never(&log_dir, "enki.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt().init();
+        None
+    }
+}
+```
+
+**Session separator:**
+
+```
+══════════════════ SESSION START ══════════════════
+[2025-03-06T14:23:45Z INFO  enki] Starting TUI
+[2025-03-06T14:23:46Z DEBUG enki_core::orchestrator] Creating task: Fix bug
+...
+```
+
+## Best Practices
+
+1. **Never await inside process_events:** Use `spawn_local` for long-running work
+2. **Drain event cascade:** Some events spawn more events (e.g., failed spawn → discover)
+3. **Check infra_broken flag:** If `cp` fails, stop spawning workers
+4. **Use signal files for coordination:** External MCP → signal file → coordinator poll
+5. **Kill sessions explicitly:** Don't rely on drop — call `mgr.kill_session()`
+6. **Monitor ticker runs every 3s:** Don't block the loop
+7. **Reconcile merges on startup:** Catch missed refinery signals
+
+## Full Example: Minimal Coordinator
+
+```rust
+use enki_acp::AgentManager;
+use enki_core::orchestrator::{Command, Event, Orchestrator};
+use enki_core::scheduler::Limits;
+use enki_core::db::Db;
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    
+    rt.block_on(async {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let db = Db::open(".enki/db.sqlite").unwrap();
+            let mut orch = Orchestrator::new(db, Limits::default(), "test".into());
+            let mgr = AgentManager::new();
+            
+            // Create task
+            let events = orch.handle(Command::CreateTask {
+                title: "Fix bug".into(),
+                description: None,
+                tier: enki_core::types::Tier::Standard,
+            });
+            
+            // Spawn worker
+            for event in events {
+                if let Event::SpawnWorker { task_id, title, .. } = event {
+                    let sid = mgr.start_session("claude", &["--acp"], std::env::current_dir().unwrap(), &task_id.0).await.unwrap();
+                    mgr.prompt(&sid, &format!("Task: {title}")).await.ok();
+                    mgr.kill_session(&sid);
+                }
+            }
+        }).await;
+    });
+}
+```

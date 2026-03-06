@@ -1,0 +1,167 @@
+---
+title: Installation
+description: Install Enki and set up your system to orchestrate multi-agent coding workflows
+---
+
+## System Requirements
+
+Before installing Enki, ensure you have the following dependencies:
+
+<Warning>
+All of these requirements are mandatory for Enki to function properly.
+</Warning>
+
+- **Git**: Used for version control and managing task branches
+- **Claude Code**: The ACP agent that Enki orchestrates (see [Claude Code documentation](https://docs.anthropic.com/en/docs/claude-code))
+- **Node.js**: Required to install and run the ACP agent runtime
+- **Rust** (if building from source): The Rust toolchain via [rustup](https://rustup.rs/)
+
+## Installation Methods
+
+<CodeGroup>
+
+```bash Homebrew (Recommended)
+brew install korbindeman/tap/enki
+```
+
+```bash Build from Source
+# Clone the repository
+git clone https://github.com/yourusername/enki.git
+cd enki
+
+# Install using cargo
+cargo install --path crates/cli
+```
+
+```bash Using Just (Development)
+# If you have just installed
+just install
+
+# This builds the release binary and installs to ~/.cargo/bin
+```
+
+</CodeGroup>
+
+## Verify Installation
+
+After installation, verify that Enki is available:
+
+```bash
+enki --version
+```
+
+You should see output similar to:
+
+```
+enki 2026.306.2
+```
+
+## What Gets Installed
+
+Enki installs a single binary (`enki`) that provides:
+
+- **TUI Interface**: Interactive terminal UI for managing agents and tasks
+- **MCP Server**: JSON-RPC stdio server for agent tool access (used internally)
+- **Coordinator**: Orchestration engine for spawning and managing ACP agents
+
+## Post-Installation Setup
+
+<Note>
+Enki automatically initializes your project on first run. You don't need to run any setup commands manually.
+</Note>
+
+When you first run `enki` in a directory, it will:
+
+1. Create a `.enki/` directory in your project
+2. Initialize the SQLite database for task tracking
+3. Set up the directory structure for worker isolation
+
+### Directory Structure
+
+After initialization, your project will contain:
+
+```
+.enki/
+├── db.sqlite          # Task and execution state
+├── roles/             # Project-specific role overrides (optional)
+├── artifacts/         # Step outputs when using artifact mode
+├── events/            # Signal files for cross-process communication
+├── copies/            # Copy-on-write clones for worker isolation
+└── logs/
+    └── enki.log       # Main log file
+```
+
+## Troubleshooting
+
+### Command Not Found
+
+If you installed via Homebrew and get "command not found":
+
+```bash
+# Check that Homebrew's bin directory is in your PATH
+echo $PATH | grep -q "$(brew --prefix)/bin" && echo "OK" || echo "Add $(brew --prefix)/bin to PATH"
+```
+
+If you installed via cargo and get "command not found":
+
+```bash
+# Ensure ~/.cargo/bin is in your PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Add to your shell profile (~/.bashrc, ~/.zshrc, etc.)
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+```
+
+### Build Errors (Source Installation)
+
+If you encounter errors building from source:
+
+```bash
+# Update Rust to the latest stable version
+rustup update stable
+
+# Ensure you're using Rust 2024 edition (requires Rust 1.85+)
+rustc --version
+```
+
+### Missing Dependencies
+
+If Enki fails to start due to missing dependencies:
+
+<Steps>
+  <Step title="Install Git">
+    ```bash
+    # macOS
+    brew install git
+
+    # Ubuntu/Debian
+    sudo apt-get install git
+
+    # Verify
+    git --version
+    ```
+  </Step>
+
+  <Step title="Install Node.js">
+    ```bash
+    # macOS
+    brew install node
+
+    # Ubuntu/Debian (using NodeSource)
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+
+    # Verify
+    node --version
+    npm --version
+    ```
+  </Step>
+
+  <Step title="Set up Claude Code">
+    Follow the [official Claude Code setup guide](https://docs.anthropic.com/en/docs/claude-code) to configure the ACP agent.
+  </Step>
+</Steps>
+
+## Next Steps
+
+Now that Enki is installed, proceed to the [Quickstart Guide](/quickstart) to create your first multi-agent workflow.

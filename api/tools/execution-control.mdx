@@ -1,0 +1,675 @@
+---
+title: Execution Control Tools
+description: Multi-step workflows with dependencies, checkpoints, and lifecycle management
+---
+
+Execution control tools orchestrate complex, multi-step workflows with dependencies between steps. Use these when work requires coordination between multiple tasks.
+
+## enki_execution_create
+
+Create a multi-step execution with dependency relationships. Steps with no dependencies start immediately; others wait for their prerequisites to complete.
+
+<Note>
+  Each step becomes a separate task that can run in parallel (if dependencies allow).
+</Note>
+
+### Input Schema
+
+<ParamField path="steps" type="array" required>
+  Array of step definitions. Minimum 1 step required.
+  
+  <Expandable title="Step object properties">
+    <ParamField path="id" type="string" required>
+      Unique step identifier within this execution (e.g., `"scaffold"`, `"auth"`, `"tests"`).
+      
+      Used by other steps to declare dependencies via the `needs` field.
+    </ParamField>
+    
+    <ParamField path="title" type="string" required>
+      Short task title for this step.
+    </ParamField>
+    
+    <ParamField path="description" type="string" required>
+      Detailed task description with acceptance criteria. Provide full context for the worker agent.
+    </ParamField>
+    
+    <ParamField path="tier" type="string" default="standard">
+      Complexity tier for capacity allocation.
+      
+      **Allowed values:** `light`, `standard`, `heavy`
+    </ParamField>
+    
+    <ParamField path="needs" type="array">
+      Array of dependencies. Each item can be:
+      
+      **1. Bare string** (step ID) - waits for merge to land:
+      ```json
+      "needs": ["scaffold", "database"]
+      ```
+      
+      **2. Object with condition** - fine-grained control:
+      ```json
+      "needs": [
+        {"step": "scaffold", "condition": "merged"},
+        {"step": "tests", "condition": "started"}
+      ]
+      ```
+      
+      **Condition values:**
+      - `merged` (default) - Unblock when merge lands on main branch
+      - `completed` - Unblock when worker finishes (before merge)
+      - `started` - Unblock as soon as worker begins running
+    </ParamField>
+    
+    <ParamField path="checkpoint" type="boolean" default={false}>
+      If `true`, execution pauses after this step's merge lands. The coordinator can review output and optionally add follow-up steps before calling `enki_resume`.
+      
+      Use checkpoints for:
+      - Manual review gates
+      - User approval points
+      - Adaptive planning (add steps based on results)
+    </ParamField>
+    
+    <ParamField path="role" type="string">
+      Agent role for this step. Roles provide specialized system prompts and tool access.
+      
+      **Built-in roles:**
+      - `feature_developer` - Building new features
+      - `bug_fixer` - Debugging and fixing issues
+      - `researcher` - Code analysis and documentation
+      - `code_referencer` - Answering questions about code
+      
+      Omit for default worker behavior. Custom roles can be defined in `.enki/roles/*.toml`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": {
+    "name": "enki_execution_create",
+    "arguments": {
+      "steps": [
+        {
+          "id": "scaffold",
+          "title": "Create project scaffold",
+          "description": "Initialize Express app with TypeScript, ESLint, and basic folder structure.",
+          "tier": "light"
+        },
+        {
+          "id": "auth",
+          "title": "Implement JWT authentication",
+          "description": "Add JWT-based auth with login, register, and token refresh endpoints. Use bcrypt for passwords.",
+          "tier": "standard",
+          "needs": ["scaffold"]
+        },
+        {
+          "id": "tests",
+          "title": "Write auth tests",
+          "description": "Jest test suite for auth endpoints with >90% coverage.",
+          "tier": "light",
+          "needs": [{"step": "auth", "condition": "completed"}]
+        },
+        {
+          "id": "docs",
+          "title": "API documentation",
+          "description": "OpenAPI spec for auth endpoints.",
+          "tier": "light",
+          "needs": [{"step": "tests", "condition": "started"}],
+          "checkpoint": true
+        }
+      ]
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Execution summary with step IDs and dependencies:
+      ```
+      execution: exec-01JXXX
+        scaffold → task-a1b2 | pending | Create project scaffold
+        auth → task-c3d4 | pending | Implement JWT authentication (needs: scaffold)
+        tests → task-e5f6 | pending | Write auth tests (needs: auth)
+        docs → task-g7h8 | pending | API documentation (needs: tests)
+      ```
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Signal File Written
+
+```json
+{
+  "type": "execution_created",
+  "execution_id": "exec-01JXXX..."
+}
+```
+
+### Dependency Resolution
+
+The DAG scheduler evaluates dependencies on each coordinator tick:
+
+1. **Bare string `"scaffold"`** → waits for merge condition (default behavior)
+2. **Object `{"step": "auth", "condition": "completed"}`** → waits for worker to finish
+3. **Object `{"step": "tests", "condition": "started"}`** → starts as soon as worker begins
+
+This enables fine-grained parallelism control. For example, documentation can start as soon as tests begin running (don't need to wait for completion).
+
+---
+
+## enki_execution_add_steps
+
+Add new steps to a running execution. Useful for adaptive planning after checkpoint reviews.
+
+<Note>
+  The execution must exist and not be completed/aborted. If paused at a checkpoint, add steps first then call `enki_resume`.
+</Note>
+
+### Input Schema
+
+<ParamField path="execution_id" type="string" required>
+  ID of the execution to add steps to.
+</ParamField>
+
+<ParamField path="steps" type="array" required>
+  Array of step definitions. Same schema as `enki_execution_create.steps`.
+  
+  New steps can depend on:
+  - Existing steps already in the execution
+  - Other new steps being added in the same call
+  
+  Step IDs must not conflict with existing steps.
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 2,
+  "params": {
+    "name": "enki_execution_add_steps",
+    "arguments": {
+      "execution_id": "exec-01JXXX",
+      "steps": [
+        {
+          "id": "deploy",
+          "title": "Deploy to staging",
+          "description": "Deploy the auth service to staging environment and run smoke tests.",
+          "tier": "standard",
+          "needs": ["docs"]
+        }
+      ]
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Summary of added steps:
+      ```
+      added 1 steps to execution exec-01JX
+        deploy → task-i9j0 | pending | Deploy to staging (needs: docs)
+      ```
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Signal File Written
+
+```json
+{
+  "type": "steps_added",
+  "execution_id": "exec-01JXXX..."
+}
+```
+
+---
+
+## enki_pause
+
+Pause an execution or a single step within an execution. Paused items stop accepting new work; running workers are allowed to finish gracefully.
+
+<Warning>
+  Use `enki_cancel` if you want to stop immediately and kill running workers.
+</Warning>
+
+### Input Schema
+
+<ParamField path="execution_id" type="string" required>
+  Execution ID to pause.
+</ParamField>
+
+<ParamField path="step_id" type="string">
+  Optional step ID within the execution. If provided, only that step is paused (other steps continue).
+</ParamField>
+
+### Request Examples
+
+**Pause entire execution:**
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 3,
+  "params": {
+    "name": "enki_pause",
+    "arguments": {
+      "execution_id": "exec-01JXXX"
+    }
+  }
+}
+```
+
+**Pause single step:**
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 4,
+  "params": {
+    "name": "enki_pause",
+    "arguments": {
+      "execution_id": "exec-01JXXX",
+      "step_id": "tests"
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Confirmation message:
+      - `"Pause signal sent for execution exec-01JXXX."`
+      - `"Pause signal sent for step 'tests' in execution exec-01JXXX."`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## enki_resume
+
+Resume a paused execution. Call after a checkpoint pause, optionally after adding new steps with `enki_execution_add_steps`.
+
+### Input Schema
+
+<ParamField path="execution_id" type="string" required>
+  ID of the paused execution to resume.
+</ParamField>
+
+<ParamField path="step_id" type="string">
+  Optional step ID. If provided, only that step is resumed.
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 5,
+  "params": {
+    "name": "enki_resume",
+    "arguments": {
+      "execution_id": "exec-01JXXX"
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Confirmation message:
+      `"Resume signal sent for execution exec-01JXXX."`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## enki_cancel
+
+Cancel an execution or a single step. Running workers are killed immediately. Cancelling a step cascades to all transitive dependents.
+
+<Warning>
+  This is destructive. Workers are killed via SIGKILL. Use `enki_pause` for graceful shutdown.
+</Warning>
+
+### Input Schema
+
+<ParamField path="execution_id" type="string" required>
+  Execution ID to cancel.
+</ParamField>
+
+<ParamField path="step_id" type="string">
+  Optional step ID. If provided, only that step (and its dependents) are cancelled.
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 6,
+  "params": {
+    "name": "enki_cancel",
+    "arguments": {
+      "execution_id": "exec-01JXXX",
+      "step_id": "deploy"
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Confirmation message:
+      `"Cancel signal sent for step 'deploy' in execution exec-01JXXX."`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Cascade Behavior
+
+If you cancel step `auth` in this DAG:
+```
+scaffold → auth → tests → docs
+```
+
+Then `tests` and `docs` are also cancelled (they transitively depend on `auth`).
+
+---
+
+## enki_stop_all
+
+Stop all running workers immediately. Use when the user requests a global halt.
+
+<Warning>
+  Kills all worker processes via SIGKILL. This affects the entire session, not just one execution.
+</Warning>
+
+### Input Schema
+
+No parameters.
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 7,
+  "params": {
+    "name": "enki_stop_all",
+    "arguments": {}
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Confirmation message:
+      `"Stop signal sent. All workers will be killed on the next coordinator poll."`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Signal Files Written
+
+Two signals are written:
+1. **Signal file:** `.enki/events/sig-*.json` with `{"type": "stop_all"}`
+2. **Legacy stop file:** `.enki/stop` (empty file)
+
+The coordinator checks both on each poll and kills all worker processes.
+
+---
+
+## enki_task_retry
+
+Retry a failed task within its execution. Resets the task to `pending`, unblocks sibling tasks that were blocked by this failure, and restores the execution to `running` status.
+
+<Note>
+  Use this instead of recreating an entire execution when only one step failed.
+</Note>
+
+### Input Schema
+
+<ParamField path="task_id" type="string" required>
+  ID of the failed task to retry. Accepts full ID (`task-01JXXX...`) or short prefix (`a1b2`).
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 8,
+  "params": {
+    "name": "enki_task_retry",
+    "arguments": {
+      "task_id": "a1b2"
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Confirmation message with side effects:
+      ```
+      Task a1b2 reset to pending. 2 blocked sibling task(s) unblocked. Execution exec-01JX restored to running.
+      ```
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Behavior
+
+1. Verify task exists and has status `failed`
+2. Reset task status to `pending`
+3. Find all sibling tasks in same execution with status `blocked` → reset to `pending`
+4. Reset execution status to `running` (so scheduler rediscovers it)
+5. Write signal file to trigger coordinator poll
+
+### Error Handling
+
+**Task not failed:**
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "task a1b2 is 'running', not 'failed' — can only retry failed tasks"
+  }
+}
+```
+
+**Task ID not found:**
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "task ID 'xyz' not found or ambiguous"
+  }
+}
+```
+
+---
+
+## Usage Patterns
+
+### Building a Feature with Checkpoints
+
+```python
+# Create execution with review gate after core implementation
+exec = await call_tool(
+    "enki_execution_create",
+    steps=[
+        {
+            "id": "core",
+            "title": "Implement rate limiter",
+            "description": "...",
+            "checkpoint": True  # Pause for review
+        },
+        {
+            "id": "tests",
+            "title": "Write tests",
+            "description": "...",
+            "needs": ["core"]
+        }
+    ]
+)
+
+# Execution runs, pauses after 'core' merge
+# Review the implementation...
+
+# Add deployment step based on review
+await call_tool(
+    "enki_execution_add_steps",
+    execution_id="exec-01JXXX",
+    steps=[{
+        "id": "deploy",
+        "title": "Deploy to staging",
+        "description": "...",
+        "needs": ["tests"]
+    }]
+)
+
+# Resume execution
+await call_tool("enki_resume", execution_id="exec-01JXXX")
+```
+
+### Handling Failures
+
+```python
+# Execution fails on step 'auth'
+status = await call_tool("enki_task_list")
+# Output: a1b2 | failed | standard | Implement auth
+#         c3d4 | blocked | light | Write tests (needs: auth)
+
+# Fix issue, retry the failed task
+await call_tool("enki_task_retry", task_id="a1b2")
+# Output: Task a1b2 reset to pending. 1 blocked sibling task(s) unblocked.
+
+# Scheduler picks it back up automatically
+```
+
+### Fine-Grained Parallelism
+
+```python
+# Start docs as soon as tests begin (don't wait for completion)
+await call_tool(
+    "enki_execution_create",
+    steps=[
+        {"id": "impl", "title": "...", "description": "..."},
+        {"id": "tests", "title": "...", "description": "...", "needs": ["impl"]},
+        {
+            "id": "docs",
+            "title": "Write docs",
+            "description": "...",
+            "needs": [{"step": "tests", "condition": "started"}]  # Parallel!
+        }
+    ]
+)
+```
+
+---
+
+## Error Handling
+
+### Duplicate Step ID
+
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "duplicate step id: auth"
+  }
+}
+```
+
+### Unknown Dependency
+
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "step 'tests' depends on unknown step 'database'"
+  }
+}
+```
+
+### Self-Dependency
+
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "step 'auth' cannot depend on itself"
+  }
+}
+```
+
+### Empty Steps Array
+
+```json
+{
+  "error": {
+    "code": -32000,
+    "message": "steps array must not be empty"
+  }
+}
+```

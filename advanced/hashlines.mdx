@@ -1,0 +1,379 @@
+---
+title: Hashlines
+description: Learn how Enki's hashline system prevents stale edits by anchoring changes to file content hashes.
+---
+
+Enki's **hashline** system solves a critical problem in multi-agent workflows: **how do you prevent agents from applying stale edits to files that have changed since they last read them?**
+
+When an agent reads a file, Enki tags each line with a hash. When the agent edits the file, it references lines by their hash. Enki verifies that the hashes match before applying the edit. If the file changed in the meantime (another agent modified it, user made a manual edit, etc.), the hashes won't match and the edit is rejected.
+
+## The Problem: Stale Edits
+
+Consider this scenario:
+
+1. **Agent A** reads `auth.rs` line 42: `let token = request.header("Authorization");`
+2. **Agent B** (running in parallel) modifies `auth.rs` line 42 to: `let token = request.bearer_token();`
+3. **Agent A** tries to edit line 42 based on its stale view of the file
+
+Without hashlines, Agent A's edit would silently corrupt the file. With hashlines, Agent A's edit is rejected with a clear error: "stale hash at line 42 — re-read the file."
+
+## Hashline Format
+
+When Enki tags a file with hashlines, each line gets a prefix:
+
+```
+{line_number:>width}:{xxh3_hash}|{content}
+```
+
+- `line_number`: 1-based line number, right-padded to width of total line count
+- `xxh3_hash`: 2-digit hex hash (low byte of XXH3-64)
+- `content`: Original line content
+
+**Example:**
+
+```rust Original file
+fn main() {
+    let x = 42;
+    println!("{}", x);
+}
+```
+
+```rust Tagged with hashlines
+1:a7|fn main() {
+2:3c|    let x = 42;
+3:f1|    println!("{}", x);
+4:b2|}
+```
+
+Line numbers are right-padded so the `|` delimiters align:
+
+```rust File with 100+ lines
+  1:a7|fn main() {
+  2:3c|    let x = 42;
+ ...
+100:d4|}
+```
+
+## Hash Computation
+
+Hashes are computed using **XXH3-64**, a fast non-cryptographic hash. Enki uses the **low byte** (2 hex digits) for compact representation.
+
+**Implementation:** `crates/core/src/hashline.rs:4-17`
+
+```rust
+pub struct LineHash(pub u8);
+
+impl LineHash {
+    pub fn compute(line_content: &str) -> Self {
+        let digest = xxh3_64(line_content.trim_ascii().as_bytes());
+        Self(digest.to_le_bytes()[0])
+    }
+
+    pub fn display(&self) -> String {
+        format!("{:02x}", self.0)
+    }
+}
+```
+
+<Info>
+Line content is **trimmed** before hashing. Leading/trailing whitespace changes don't invalidate the hash. This makes hashlines robust to indentation normalization.
+</Info>
+
+## Tag and Strip
+
+### Tagging Content
+
+The `tag_content` function adds hashline prefixes:
+
+```rust
+let content = "fn main() {\n    let x = 42;\n}";
+let tagged = enki_core::hashline::tag_content(content);
+// tagged = "1:a7|fn main() {\n2:3c|    let x = 42;\n3:b2|}"
+```
+
+**Implementation:** `crates/core/src/hashline.rs:23-48`
+
+### Stripping Hashlines
+
+The `strip_hashlines` function removes prefixes:
+
+```rust
+let tagged = "1:a7|fn main() {\n2:3c|    let x = 42;\n3:b2|}";
+let stripped = enki_core::hashline::strip_hashlines(tagged);
+// stripped = "fn main() {\n    let x = 42;\n}"
+```
+
+**Implementation:** `crates/core/src/hashline.rs:93-118`
+
+Lines without valid hashline prefixes are passed through unchanged.
+
+## Anchor Verification
+
+When an agent edits a file, it provides **anchors** (hashline-prefixed lines) mixed with new content:
+
+```rust Edit content
+2:3c|    let x = 42;
+    let y = x * 2;  // new line inserted
+3:f1|    println!("{}", x);
+```
+
+Before applying the edit, Enki verifies that:
+1. Referenced line numbers are in range
+2. Hashes match the current file content at those line numbers
+
+**Implementation:** `crates/core/src/hashline.rs:123-161` (verify_hashlines), `crates/core/src/hashline.rs:171-260` (apply_edit)
+
+### Verification Flow
+
+```rust
+let current_content = std::fs::read_to_string("auth.rs")?;
+let edit_content = "2:3c|    let token = ..."; // from agent
+
+let result = enki_core::hashline::apply_edit(edit_content, current_content);
+match result {
+    Ok(new_content) => {
+        std::fs::write("auth.rs", new_content)?;
+        println!("Edit applied");
+    }
+    Err(e) if e.contains("stale hash") => {
+        println!("File changed since you last read it. Re-read and retry.");
+    }
+    Err(e) => println!("Edit failed: {}", e),
+}
+```
+
+## Edit Semantics
+
+Edits are specified by mixing **anchors** (existing lines referenced by hashline) and **new lines** (no prefix):
+
+### Replace Lines
+
+Anchor the lines before and after the region to replace, put new content between:
+
+```rust
+2:3c|    let x = 42;
+    let y = x * 2;  // new
+    let z = y + 1;  // new
+5:d1|    return z;
+```
+
+**Effect:** Lines 3-4 (between anchor 2 and anchor 5) are deleted, new lines inserted.
+
+### Insert After Line
+
+Anchor a line, follow with new content:
+
+```rust
+2:3c|    let x = 42;
+    let y = x * 2;  // inserted after line 2
+```
+
+**Effect:** New line inserted after line 2.
+
+### Insert Before Line
+
+New content first, then anchor:
+
+```rust
+    let y = x * 2;  // inserted before line 2
+2:3c|    let x = 42;
+```
+
+**Effect:** New line inserted before line 2 (between line 1 and line 2).
+
+### Delete Lines
+
+Anchor the lines before and after the region to delete, with no content between:
+
+```rust
+2:3c|    let x = 42;
+5:d1|    return z;
+```
+
+**Effect:** Lines 3-4 deleted.
+
+### Rules
+
+1. **At least one anchor required** — edits without anchors are rejected
+2. **Anchors must be in ascending order** — `3:...` cannot come before `2:...`
+3. **Hashes must match current file** — stale edits are rejected
+4. **Region between first and last anchor is replaced** — everything else is preserved
+
+## MCP Tool: enki_edit_file
+
+Workers call the `enki_edit_file` MCP tool to apply edits:
+
+```json MCP tool call
+{
+  "name": "enki_edit_file",
+  "arguments": {
+    "path": "/path/to/file.rs",
+    "content": "2:3c|    let x = 42;\n    let y = x * 2;\n3:f1|    println!(\"{}\", x);"
+  }
+}
+```
+
+**Handler:** `crates/cli/src/commands/mcp/handlers.rs:544-557`
+
+```rust
+pub(super) fn tool_edit_file(args: &Value) -> Result<String, String> {
+    let path = args["path"].as_str().ok_or("missing required parameter: path")?;
+    let content = args["content"].as_str().ok_or("missing required parameter: content")?;
+
+    let current = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {path}: {e}"))?;
+
+    let result = enki_core::hashline::apply_edit(content, &current)?;
+
+    std::fs::write(path, &result)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    Ok("ok".to_string())
+}
+```
+
+<Warning>
+`enki_edit_file` is only available to workers with `can_edit = true` in their role config. See [Custom Roles](/advanced/custom-roles).
+</Warning>
+
+## Why Hashlines Prevent Stale Edits
+
+Consider the parallel agent scenario:
+
+**Timeline:**
+
+1. **T=0:** File content is `let x = 42;` at line 2 (hash `3c`)
+2. **T=1:** Agent A reads file, sees `2:3c|    let x = 42;`
+3. **T=2:** Agent B modifies line 2 to `let x = 99;` (new hash `7f`)
+4. **T=3:** Agent A tries to edit: `2:3c|    let x = 42;` + new content
+5. **T=3:** Enki computes current hash for line 2: `7f`
+6. **T=3:** Hash mismatch: expected `3c`, got `7f` → **edit rejected**
+
+**Error message:**
+```
+stale hash at line 2: expected 3c, got 7f — re-read the file
+```
+
+Agent A must re-read the file, see the new content (`let x = 99;`), and provide a fresh edit with the correct hash (`7f`).
+
+## Hash Collision Risk
+
+Enki uses **1 byte (256 possible values)** for line hashes. What's the collision probability?
+
+**Birthday paradox:** With ~16 lines, there's a ~5% chance of collision. With ~50 lines, collision is likely.
+
+**Why this is acceptable:**
+
+1. **Collisions are safe, not catastrophic:** A collision means two different lines have the same hash. Enki will incorrectly accept an edit if the agent references the wrong line. This is rare and detectable (the edit produces nonsensical code, tests fail, human reviews the diff).
+2. **Edits are localized:** Agents typically edit small regions (5-10 lines). Collision within a small region is unlikely.
+3. **Context from line numbers:** Line numbers + hashes together make collisions even rarer. For a collision to cause a bad edit, two lines with the same hash must be in the same region **and** the agent must reference the wrong one.
+
+**Empirical observation:** In practice, hashline collisions have not been a problem in Enki's development.
+
+<Info>
+If collision becomes a problem, Enki could switch to 2-byte hashes (65k values) or full 8-byte XXH3 hashes. The current 1-byte design prioritizes compactness and readability.
+</Info>
+
+## Implementation Details
+
+### Hash Trimming
+
+Line content is **trimmed** before hashing:
+
+```rust
+LineHash::compute("  foo  ") == LineHash::compute("foo")  // true
+```
+
+This makes hashlines robust to:
+- Indentation changes (tabs ↔ spaces)
+- Trailing whitespace normalization
+- Editor auto-formatting
+
+### Anchor Parsing
+
+Anchors are parsed with `try_parse_anchor`:
+
+```rust
+fn try_parse_anchor(line: &str) -> Option<(u32, LineHash)> {
+    let pos = line.find('|')?;
+    let prefix = &line[..pos];
+    let (num_part, hash_part) = prefix.trim_start().split_once(':')?;
+    if num_part.chars().all(|c| c.is_ascii_digit())
+        && !num_part.is_empty()
+        && hash_part.len() == 2
+        && hash_part.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        parse_hashline(&format!("{}:{}", num_part, hash_part))
+    } else {
+        None
+    }
+}
+```
+
+**Rules:**
+- Line must contain `|`
+- Prefix before `|` must be `{digits}:{2hex}`
+- Leading whitespace is ignored (allows indented anchors)
+
+### Apply Edit Algorithm
+
+**Implementation:** `crates/core/src/hashline.rs:171-260`
+
+1. **Parse edit content** into anchors and new lines
+2. **Verify all anchors** against current file (hash + range check)
+3. **Extract edit region:** From first anchor to last anchor (inclusive)
+4. **Build result:**
+   - Lines before edit region (unchanged)
+   - Replacement content (anchors + new lines from edit)
+   - Lines after edit region (unchanged)
+5. **Preserve trailing newline behavior** of original file
+
+**Edge cases:**
+- Single anchor: inserts/appends relative to that anchor
+- Anchors at start/end of file: preserves leading/trailing content
+- Empty edit region (two consecutive anchors): deletes lines between them
+
+## Debugging Hashlines
+
+### Check if Content is Tagged
+
+```rust
+let is_tagged = enki_core::hashline::looks_like_tagged(content);
+```
+
+Looks for `{digits}:{2hex}|` pattern in first non-empty line.
+
+### Compute Hashlines Manually
+
+```rust
+let hashlines = enki_core::hashline::compute_hashlines(content);
+for (line_num, hash) in &hashlines {
+    println!("{}: {}", line_num, hash.display());
+}
+```
+
+### Verify Anchors
+
+```rust
+let result = enki_core::hashline::verify_hashlines(tagged_content, current_content);
+if let Err(e) = result {
+    println!("Verification failed: {}", e);
+}
+```
+
+## Best Practices
+
+1. **Always re-read before editing:** If an edit fails with "stale hash", the agent should re-read the file and compute a fresh edit.
+2. **Edit small regions:** Large edits (50+ lines) increase collision risk. Break into smaller edits if possible.
+3. **Use anchors strategically:** Anchor the lines immediately before and after the edit region for precise targeting.
+4. **Test with conflicts:** Simulate parallel edits in your test suite to ensure hashline verification catches stale edits.
+
+## Limitations
+
+- **No multi-file transactions:** Hashlines verify per-file. If an agent edits two files based on a consistent view, and another agent changes one file in between, the edits may be inconsistent. Enki relies on merge conflict detection to catch this.
+- **No content-addressable storage:** Hashlines verify anchors, but don't prevent agents from seeing inconsistent views of multiple files. Enki's CoW copy manager isolates workers, but changes merge asynchronously.
+- **1-byte hash collisions:** Rare but possible. If collision causes a bad edit, tests/review should catch it.
+
+<Tip>
+Hashlines are a lightweight, practical solution to stale edit detection. For stronger consistency guarantees, consider implementing multi-file transactions or snapshot isolation (not currently in Enki).
+</Tip>

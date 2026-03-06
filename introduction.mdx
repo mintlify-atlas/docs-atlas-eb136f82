@@ -1,0 +1,157 @@
+---
+title: "Introduction"
+description: "Multi-agent coding orchestrator that spawns ACP agents in isolated project copies, manages them as a DAG, and merges their work back"
+---
+
+<div style={{
+  background: 'linear-gradient(135deg, #f4f3ee 0%, #e8e5dd 100%)',
+  borderRadius: '8px',
+  padding: '3rem 2rem',
+  marginBottom: '2rem',
+  border: '1px solid #e6c9b9'
+}}>
+  <h1 style={{
+    fontFamily: 'Georgia, serif',
+    fontSize: '2.5rem',
+    fontWeight: 700,
+    color: '#fa4c2a',
+    marginBottom: '1rem'
+  }}>
+    Enki
+  </h1>
+  <p style={{
+    fontFamily: 'Georgia, serif',
+    fontSize: '1.25rem',
+    color: '#3B3229',
+    marginBottom: '1.5rem'
+  }}>
+    Multi-agent coding orchestrator that spawns ACP agents in isolated project copies, manages them as a DAG, and merges their work back.
+  </p>
+  <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+    <a href="/installation" style={{
+      background: '#e94b35',
+      color: '#ffffff',
+      padding: '0.75rem 1.5rem',
+      borderRadius: '4px',
+      textDecoration: 'none',
+      fontFamily: 'Georgia, serif',
+      fontWeight: 600
+    }}>
+      Get Started →
+    </a>
+    <a href="https://github.com/korbindeman/enki" style={{
+      background: '#f3f1eb',
+      color: '#4a4a4a',
+      padding: '0.75rem 1.5rem',
+      borderRadius: '4px',
+      textDecoration: 'none',
+      fontFamily: 'Georgia, serif',
+      fontWeight: 600
+    }}>
+      View on GitHub
+    </a>
+  </div>
+</div>
+
+## How Enki Works
+
+Enki orchestrates coding agents without making LLM API calls itself. It manages agent processes, state, and task execution:
+
+1. **You describe work in the TUI** — A coordinator agent splits it into tasks with dependencies
+2. **Each task runs in isolation** — Copy-on-write clones of your project with everything (build artifacts, node_modules)
+3. **Agents run tasks in parallel** — Respecting the dependency graph and concurrency limits
+4. **Work gets merged back** — Finished work merges into your working directory
+
+Works in any folder, git or not. In a git repo, enki commits each task on a branch and merges through a queue. Without git, it uses git internally to track changes but doesn't leave a repo behind.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="DAG-Based Execution" icon="project-diagram" href="/concepts/dag-execution">
+    Dependency graph scheduling with parallel execution and intelligent concurrency control
+  </Card>
+  <Card title="Worker Isolation" icon="layer-group" href="/concepts/worker-isolation">
+    Copy-on-write filesystem clones keep workers isolated with warm build caches
+  </Card>
+  <Card title="Tier System" icon="gauge-high" href="/concepts/roles">
+    Light/standard/heavy task tiers control which models run tasks and how many run concurrently
+  </Card>
+  <Card title="Git Merge Queue" icon="code-merge" href="/concepts/merge-queue">
+    Automatic merge conflict resolution with dedicated merger agent
+  </Card>
+  <Card title="Role System" icon="users-gear" href="/advanced/custom-roles">
+    Customizable agent roles with specific behaviors and output modes
+  </Card>
+  <Card title="MCP Server" icon="server" href="/advanced/mcp-tools">
+    JSON-RPC server for external tool access with role-based filtering
+  </Card>
+  <Card title="Hashline Verification" icon="shield-check" href="/advanced/hashlines">
+    Content-addressed line tracking prevents stale edits
+  </Card>
+  <Card title="TUI Interface" icon="terminal" href="/usage/tui-interface">
+    Terminal UI with streaming markdown rendering and real-time updates
+  </Card>
+</CardGroup>
+
+## Requirements
+
+<CardGroup cols={2}>
+  <Card title="Git" icon="git-alt">
+    Version control system for tracking changes
+  </Card>
+  <Card title="Claude Code" icon="robot">
+    The ACP agent that enki orchestrates
+  </Card>
+  <Card title="Node.js" icon="node-js">
+    Used to install and run the ACP agent
+  </Card>
+  <Card title="Rust" icon="rust">
+    Required if building from source
+  </Card>
+</CardGroup>
+
+## Architecture
+
+Enki is a Rust workspace with four crates that maintain strict dependency direction (no cycles):
+
+| Crate | Role |
+|-------|------|
+| **core** | Pure sync state machines: orchestrator, DAG scheduler, SQLite persistence, CoW copy manager, git merge refinery, roles, hashlines. Zero async, zero tokio. |
+| **acp** | Async ACP client. Spawns agent subprocesses, manages sessions, routes streaming updates. All internal state is `Rc<RefCell<...>>` — `!Send`, must run on a `LocalSet`. |
+| **tui** | Sync terminal UI library over raw `crossterm` (not ratatui). Chat framework via `Handler<M>` trait. Optional markdown rendering with `termimad` and `syntect`. |
+| **cli** | The `enki` binary. No args → TUI. `enki mcp` → JSON-RPC stdio server. Houses the coordinator loop (`tokio::select!` on dedicated OS thread). |
+
+<Note>
+  **Data flow:** User → Coordinator (cli) → Orchestrator (core) produces `Vec<Event>` → Coordinator dispatches workers via AgentManager (acp) → Workers call back through MCP tools → Signal files → Coordinator polls on 3s tick.
+</Note>
+
+## Quick Links
+
+<CardGroup cols={3}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install enki via Homebrew or build from source
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get up and running in minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/api/enki">
+    Complete command-line interface documentation
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Deep dive into enki's architecture
+  </Card>
+  <Card title="MCP Tools" icon="wrench" href="/api/tools/overview">
+    External tool access reference
+  </Card>
+  <Card title="Contributing" icon="code-branch" href="/development/setup">
+    Set up your development environment
+  </Card>
+</CardGroup>
+
+## Acknowledgements
+
+Enki is inspired by [Gastown](https://github.com/steveyegge/gastown) by Steve Yegge and built on the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol).
+
+## License
+
+Enki is MIT licensed. See the [LICENSE](https://github.com/korbindeman/enki/blob/main/LICENSE) file for details.

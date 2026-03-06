@@ -1,0 +1,388 @@
+---
+title: "Creating Tasks"
+description: "Define work for agent workers through the coordinator"
+---
+
+## Task Creation Flow
+
+Tasks are created by the **coordinator agent** using MCP tools. You don't call these tools directly—instead, you describe work in natural language, and the coordinator plans and creates the appropriate tasks or executions.
+
+<Steps>
+  <Step title="User describes work">
+    You type a request in the TUI chat:
+
+    ```
+    Fix the bug where users can't upload files larger than 1MB
+    ```
+  </Step>
+
+  <Step title="Coordinator explores">
+    The coordinator reads relevant code to understand context:
+
+    - Upload handling code
+    - Configuration files (size limits)
+    - Error logs or issue descriptions
+  </Step>
+
+  <Step title="Coordinator creates execution">
+    The coordinator calls `enki_execution_create` with steps:
+
+    ```json
+    {
+      "steps": [
+        {
+          "id": "fix_upload_limit",
+          "title": "Increase upload size limit",
+          "description": "Update nginx.conf client_max_body_size and app config MAX_FILE_SIZE to 10MB. Update error messages to reflect new limit.",
+          "tier": "light",
+          "needs": []
+        },
+        {
+          "id": "test_upload",
+          "title": "Test large file upload",
+          "description": "Write integration test for 5MB file upload. Verify success and check error handling for 11MB file.",
+          "tier": "standard",
+          "needs": ["fix_upload_limit"]
+        }
+      ]
+    }
+    ```
+  </Step>
+
+  <Step title="Workers execute automatically">
+    The orchestrator spawns workers for ready tasks. No manual trigger needed.
+  </Step>
+</Steps>
+
+## Standalone Tasks vs. Executions
+
+### Standalone Tasks
+
+Use `enki_task_create` for **isolated, independent work**:
+
+```json
+{
+  "title": "Fix typo in README",
+  "description": "Change 'configuraiton' to 'configuration' on line 42",
+  "tier": "light"
+}
+```
+
+**When to use:**
+
+- One-off quick fixes
+- Single-file changes
+- No dependencies on other work
+
+### Executions (Multi-Step Workflows)
+
+Use `enki_execution_create` for **related work with dependencies**:
+
+```json
+{
+  "steps": [
+    {
+      "id": "scaffold",
+      "title": "Create payment module structure",
+      "description": "Create src/payments/ with types.ts, client.ts, webhooks.ts stubs",
+      "tier": "light",
+      "needs": []
+    },
+    {
+      "id": "stripe_integration",
+      "title": "Implement Stripe client",
+      "description": "Implement client.ts with createPaymentIntent, confirmPayment",
+      "tier": "standard",
+      "needs": ["scaffold"]
+    },
+    {
+      "id": "webhook_handler",
+      "title": "Implement webhook handlers",
+      "description": "Implement webhooks.ts for payment_intent.succeeded, payment_intent.failed",
+      "tier": "standard",
+      "needs": ["scaffold"]
+    }
+  ]
+}
+```
+
+**When to use:**
+
+- 2+ related tasks
+- Dependencies between tasks ("B needs A to finish first")
+- Parallel work opportunities (both B and C can run after A)
+- Checkpoints for review/approval between phases
+
+<Info>
+Always prefer executions over standalone tasks for multi-part work. Executions track relationships, enable parallelism, and provide better observability.
+</Info>
+
+## Task Tiers
+
+Tiers determine which model handles the task and how many can run concurrently:
+
+### Light
+
+**For:** Mechanical, low-ambiguity work
+
+- Renaming variables/functions
+- Formatting code
+- Generating boilerplate (stubs, types, config files)
+- Simple documentation updates
+
+**Concurrency limit:** 10 (default)
+
+**Model:** Typically fast, inexpensive models (e.g., Claude Haiku, GPT-4o mini)
+
+### Standard
+
+**For:** Typical feature implementation and bug fixes
+
+- Implementing functions/endpoints
+- Writing tests
+- Bug fixes with known root cause
+- Refactoring with clear scope
+
+**Concurrency limit:** 5 (default)
+
+**Model:** Balanced capability/cost (e.g., Claude Sonnet, GPT-4o)
+
+### Heavy (Default)
+
+**For:** Complex, ambiguous, or high-stakes work
+
+- Architectural decisions
+- Complex debugging (unknown root cause)
+- Large refactors spanning many files
+- Security-sensitive code
+- Work requiring deep reasoning
+
+**Concurrency limit:** 5 (default)
+
+**Model:** Most capable models (e.g., Claude Opus, GPT-4)
+
+<Tip>
+When in doubt, use **standard** tier. The coordinator can adjust if it sees failures or insufficient quality.
+</Tip>
+
+## Task Descriptions and Acceptance Criteria
+
+Good task descriptions are **specific, scoped, and actionable**:
+
+### Good Examples
+
+```
+Title: Implement user profile endpoint
+Description: Add GET /api/users/:id endpoint in src/routes/users.ts. Return JSON with {id, name, email, created_at}. Use existing User model from src/models/user.ts. Add authentication middleware. Return 404 if user not found, 403 if requesting user doesn't match ID (unless admin).
+Tier: standard
+```
+
+```
+Title: Add database indexes for query performance
+Description: Based on slow query log analysis, add indexes to users(email), posts(user_id, created_at), and comments(post_id). Run EXPLAIN on the three slow queries from the performance report to verify index usage. Migration file in db/migrations/.
+Tier: light
+```
+
+```
+Title: Debug intermittent test flake in auth test suite
+Description: The "concurrent login requests" test fails ~30% of the time with "database locked" error. Reproduce locally by running test 10x. Investigate transaction handling and connection pooling. Fix the race condition.
+Tier: heavy
+```
+
+### Bad Examples
+
+❌ **Too vague:**
+
+```
+Title: Improve the API
+Description: Make the API better
+```
+
+❌ **Too broad (should be an execution with multiple steps):**
+
+```
+Title: Add payment processing
+Description: Integrate Stripe and handle all payment flows
+```
+
+❌ **Missing context:**
+
+```
+Title: Fix the bug
+Description: Users are complaining about errors
+```
+
+### Best Practices
+
+<AccordionGroup>
+  <Accordion title="Include file paths">
+    Tell workers where to look:
+
+    ```
+    Modify the authentication logic in src/auth/middleware.ts to support API keys in addition to JWT tokens.
+    ```
+
+    This reduces exploration time and ensures workers focus on the right code.
+  </Accordion>
+
+  <Accordion title="Specify acceptance criteria">
+    Define what "done" looks like:
+
+    ```
+    Add validation to the registration form. Email must be valid format, password must be 8+ chars with 1 number. Display inline error messages. All existing tests must pass.
+    ```
+  </Accordion>
+
+  <Accordion title="Reference upstream context">
+    Workers can't see each other's branches—only completed outputs. Reference what they need:
+
+    ```
+    Using the database schema from the "scaffold" step, implement the UserRepository class with methods for create, findById, findByEmail, and update.
+    ```
+  </Accordion>
+
+  <Accordion title="Keep tasks focused">
+    Each task should change **no more than a few files**. If you're describing changes to 5+ files, split into multiple steps:
+
+    ```
+    ✓ Step 1: Update User model with profile fields
+    ✓ Step 2: Add profile endpoints (depends: 1)
+    ✓ Step 3: Update UI to display profile (depends: 2)
+    ```
+
+    Not:
+
+    ```
+    ✗ Add user profiles (models, API, UI, tests)
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Scaffold-First Pattern
+
+For greenfield projects or major new features, use a **scaffold step** to establish structure before parallel implementation:
+
+<Steps>
+  <Step title="Scaffold creates structure">
+    ```json
+    {
+      "id": "scaffold",
+      "title": "Create analytics module structure",
+      "description": "Create src/analytics/ with types.ts (Event, Metric interfaces), tracker.ts (stub class), storage.ts (stub interface), config.ts (default config). Document the event schema in a comment.",
+      "tier": "light",
+      "needs": []
+    }
+    ```
+
+    The scaffold defines:
+
+    - Directory structure
+    - Type definitions and interfaces
+    - Stub files
+    - Shared contracts
+  </Step>
+
+  <Step title="Implementation steps run in parallel">
+    ```json
+    [
+      {
+        "id": "tracker",
+        "title": "Implement event tracker",
+        "description": "Implement tracker.ts using types from types.ts",
+        "tier": "standard",
+        "needs": ["scaffold"]
+      },
+      {
+        "id": "storage",
+        "title": "Implement storage backend",
+        "description": "Implement storage.ts with PostgreSQL backend",
+        "tier": "standard",
+        "needs": ["scaffold"]
+      },
+      {
+        "id": "api",
+        "title": "Add analytics API endpoints",
+        "description": "Add POST /analytics/events using tracker",
+        "tier": "standard",
+        "needs": ["scaffold"]
+      }
+    ]
+    ```
+
+    All three implementation steps can run simultaneously after the scaffold completes.
+  </Step>
+</Steps>
+
+**Skip the scaffold when:**
+
+- Working within existing, established modules
+- Making bug fixes or small enhancements
+- Only one task to do
+
+## Checkpoint Steps
+
+Mark a step with `"checkpoint": true` to pause the execution after that step completes:
+
+```json
+{
+  "id": "investigate",
+  "title": "Research memory usage patterns",
+  "description": "Profile the app under load. Identify top memory consumers. Document findings with heap snapshots.",
+  "tier": "heavy",
+  "checkpoint": true,
+  "needs": []
+}
+```
+
+When the checkpoint is reached:
+
+1. The coordinator receives a notification with the step's output
+2. The execution pauses—no new steps start
+3. The coordinator reviews findings and can:
+   - Call `enki_execution_add_steps` to add follow-up steps based on the research
+   - Call `enki_resume` to continue with pre-planned steps
+
+**Use checkpoints for:**
+
+- Investigation/research steps where findings determine next actions
+- Prototype/proof-of-concept steps requiring approval before full implementation
+- Multi-phase rollouts where each phase needs validation
+
+## Task Output
+
+Workers produce output in two forms:
+
+### Code Changes (Branch)
+
+Default behavior. The worker:
+
+1. Modifies files in its isolated copy (`.enki/copies/<task-id>/`)
+2. Enki commits changes to a branch (`task/<task-id>`)
+3. The branch is fetched and merged via the refinery
+4. Downstream steps see merged changes on main
+
+Workers include a summary in `[OUTPUT]...[/OUTPUT]` tags:
+
+```
+[OUTPUT]
+Added JWT authentication middleware to src/auth/jwt.ts. Updated routes in src/routes/auth.ts to use the middleware. All auth tests passing.
+[/OUTPUT]
+```
+
+This summary is captured and passed to dependent steps as context.
+
+### Markdown Artifact
+
+When using a role with `output = "artifact"` (like `researcher`), the worker:
+
+1. Does NOT modify project files
+2. Writes a markdown report to `.enki/artifacts/<execution-id>/<step-id>.md`
+3. No merge happens
+4. Downstream steps receive the artifact path as context
+
+Example artifact roles:
+
+- `researcher` — investigates code, external docs, or traces execution
+- `code_referencer` — produces API documentation or reference material
+
+See [Agent Roles](/concepts/roles) for details on configuring artifact workers.

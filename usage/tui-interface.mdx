@@ -1,0 +1,227 @@
+---
+title: "TUI Interface"
+description: "Navigate the terminal interface and interact with the coordinator agent"
+---
+
+## Interface Layout
+
+The Enki TUI is built with raw `crossterm` (not ratatui) and provides a chat-based interface for interacting with the coordinator agent. The layout consists of:
+
+- **Title bar**: Shows "enki" and your project name
+- **Chat area**: Scrolling message history with markdown rendering
+- **Worker panel**: (toggleable) Real-time status of active workers
+- **Input area**: Pinned at the bottom with a `› ` prompt
+
+## Chat Interface
+
+The chat area displays:
+
+- **Your messages**: Prompts and questions you send to the coordinator
+- **Coordinator responses**: Streamed in real-time with markdown formatting (via `termimad` + `syntect` for syntax highlighting)
+- **System events**: Task spawns, completions, failures, merge status updates
+- **Tool call indicators**: Visual feedback when the coordinator uses MCP tools
+
+### Markdown Rendering
+
+The coordinator's responses are rendered with full markdown support:
+
+- Headers, lists, code blocks with syntax highlighting
+- Bold, italic, inline code
+- Tables (for displaying task lists)
+
+Code blocks in the coordinator's responses show the language tag and use syntax highlighting appropriate for the content.
+
+## Interacting with the Coordinator
+
+The coordinator agent is your primary interface. You describe work in natural language, and the coordinator:
+
+1. **Explores** the codebase to understand context
+2. **Plans** the work by decomposing it into steps
+3. **Creates executions** using MCP tools
+4. **Tracks progress** as workers complete their tasks
+5. **Reports** on status, failures, and next steps
+
+<Steps>
+  <Step title="Describe your work">
+    Type a natural language request describing what you want to build, fix, or investigate:
+
+    ```
+    Add user authentication with JWT tokens
+    ```
+
+    ```
+    Fix the memory leak in the data processing pipeline
+    ```
+
+    ```
+    Research how the payment module handles refunds
+    ```
+  </Step>
+
+  <Step title="Review the plan">
+    The coordinator will explore the relevant code, then present a plan. For complex or ambiguous work, it may ask clarifying questions about:
+
+    - Architectural approach ("Should auth use JWT or session tokens?")
+    - Scope boundaries ("Should I fix just checkout or the underlying payment abstraction?")
+    - Tradeoffs ("Migrate in-place (faster, riskier) or build alongside (slower, safer)?")
+
+    For straightforward tasks with clear scope, it will proceed directly.
+  </Step>
+
+  <Step title="Monitor progress">
+    Once the execution is created, the coordinator spawns workers automatically. You'll see:
+
+    - **Worker spawned** events: `▶ Worker spawned: Implement JWT middleware (a1b2)`
+    - **Worker completed** events: `✓ Worker completed: Implement JWT middleware (a1b2)`
+    - **Merge queued/landed** events: `⊕ Merge queued: task/task-a1b2c3d4`
+    - **Progress narration**: The coordinator provides context ("Step 2/4 merged — route handlers are next")
+
+    Workers run in parallel where dependencies allow, so multiple tasks may execute simultaneously.
+  </Step>
+
+  <Step title="Address failures">
+    If a worker fails, you'll see:
+
+    ```
+    ✗ Worker failed: Run integration tests (c5d6): build error in auth.rs
+      Session log tail (full log: ~/.enki/logs/sessions/worker-c5d6.log):
+      [excerpt of last tool calls and errors]
+    ```
+
+    The coordinator will read the session log excerpt and diagnose the issue. It may:
+
+    - **Retry** automatically (timeouts, no-changes failures get up to 2 retries)
+    - **Retry with enki_task_retry** to add another attempt
+    - **Adjust the plan** if the original approach was flawed
+
+    You can also inspect the full session log yourself to understand what the worker attempted.
+  </Step>
+</Steps>
+
+## Worker Status Panel
+
+Press **`Ctrl+W`** to toggle the worker status panel. When visible, it shows:
+
+- Active worker count
+- Each running worker with:
+  - Task title
+  - Tier (light/standard/heavy)
+  - Current activity (tool name or "Thinking")
+
+The panel updates in real-time as workers start new tools or complete operations.
+
+### Activity Indicators
+
+Worker activity is tracked through ACP session updates:
+
+- **Tool name**: Shows which tool the worker is currently using (e.g., "Read", "Edit", "Bash")
+- **"Thinking"**: The worker is streaming text (reasoning) between tool calls
+- **Custom status**: Workers can report phase updates via `enki_worker_report` (e.g., "analyzing codebase", "running tests")
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+W` | Toggle worker status panel |
+| `Ctrl+C` | Interrupt current coordinator response (first press) / Exit (second press within 5s) |
+| `@` | Trigger fuzzy file autocomplete |
+| `Up/Down` | Navigate input history |
+
+## Autocomplete
+
+Type `@` to trigger fuzzy file path completion. The autocomplete:
+
+- Walks your project directory using `.gitignore` rules
+- Performs fuzzy matching with `nucleo-matcher` (fzf-style scoring)
+- Shows top 10 matches sorted by score
+- Appends `/` to directories
+
+<Tip>
+Use `@` when you want to reference specific files in your prompts to the coordinator, like "Check the auth logic in @src/auth/middleware.ts"
+</Tip>
+
+## Streaming and Responsiveness
+
+The coordinator's responses stream in real-time. You'll see:
+
+1. **Text streaming**: Words appear as the agent reasons
+2. **Tool call started**: Visual indicator when a tool begins (e.g., "📋 enki_execution_create")
+3. **Tool call done**: Brief "thinking" indicator after the tool completes
+4. **Turn complete**: The coordinator yields control, waiting for your next input
+
+### Interrupting
+
+Press `Ctrl+C` once to interrupt the coordinator mid-response. This is useful if:
+
+- The coordinator is pursuing the wrong approach
+- You want to provide additional context before it continues
+- You need to stop an overly long response
+
+The coordinator will halt cleanly and wait for your next message.
+
+## Event Messages
+
+System events appear in the chat with distinct formatting:
+
+- **Worker spawned**: `▶` (cyan) — A new agent started working on a task
+- **Worker completed**: `✓` (green) — Worker finished successfully
+- **Worker failed**: `✗` (red) — Worker encountered an error
+- **Merge queued**: `⊕` (cyan) — Task output is queued for merge
+- **Merge landed**: `✓` (green) — Changes merged to main successfully
+- **Merge conflict**: `⚠` (yellow, bold) — Manual conflict resolution needed
+- **Merge failed**: `✗` (red) — Merge failed (conflict or verification)
+- **Mail**: `✉` (cyan) — Inter-agent message (usually escalations or checkpoint notifications)
+- **All stopped**: `■` (yellow) — All workers were terminated
+
+## Desktop Notifications
+
+The TUI sends desktop notifications for important events:
+
+- Coordinator turn complete ("Enki is waiting for input")
+- Merge conflicts ("Merge conflict: task/task-a1b2c3d4")
+- All workers stopped
+- Errors
+
+This allows you to multitask and return to the terminal when enki needs your attention.
+
+## Example Session Flow
+
+```
+› Add user login with email and password
+
+[Coordinator explores codebase, reads auth-related files]
+
+📋 enki_execution_create
+
+I've created a 3-step execution:
+
+1. **Database migration** (light) — Add users table with email, password_hash
+2. **Auth endpoints** (standard, depends: 1) — POST /login, /register with JWT
+3. **Tests** (standard, depends: 2) — Integration tests for auth flow
+
+Steps 2 and 3 will run after step 1 completes.
+
+▶ Worker spawned: Database migration (a1b2)
+[Worker runs in copy at .enki/copies/task-a1b2/]
+✓ Worker completed: Database migration (a1b2)
+⊕ Merge queued: task/task-a1b2c3d4
+✓ Merge landed: task/task-a1b2c3d4
+
+Step 1/3 (Database migration) merged. Auth endpoints are next.
+
+▶ Worker spawned: Auth endpoints (c5d6)
+✓ Worker completed: Auth endpoints (c5d6)
+⊕ Merge queued: task/task-c5d6e7f8
+✓ Merge landed: task/task-c5d6e7f8
+
+Step 2/3 (Auth endpoints) merged. Running tests now.
+
+▶ Worker spawned: Tests (e9f0)
+✓ Worker completed: Tests (e9f0)
+⊕ Merge queued: task/task-e9f0a1b2
+✓ Merge landed: task/task-e9f0a1b2
+
+All 3 steps done. User login is in place with email/password auth, JWT tokens, and passing tests.
+
+› 
+```

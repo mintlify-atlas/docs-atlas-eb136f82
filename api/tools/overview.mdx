@@ -1,0 +1,142 @@
+---
+title: MCP Tools Overview
+description: Understanding Enki's Model Context Protocol (MCP) tool system
+---
+
+Enki exposes a Model Context Protocol (MCP) server that provides tools for orchestrating multi-agent workflows. The MCP server runs as a JSON-RPC 2.0 interface over stdio, allowing AI agents to create, manage, and coordinate tasks.
+
+## Protocol Architecture
+
+### JSON-RPC 2.0 over stdio
+
+The MCP server communicates using JSON-RPC 2.0 messages over standard input/output:
+
+```bash
+enki mcp [--task-id <ID>] [--role <ROLE>]
+```
+
+- `--task-id`: Identifies which task this agent is working on (for workers)
+- `--role`: Agent role (`planner` or `worker`) determines tool access
+
+### Role-Based Tool Filtering
+
+Different agent roles have access to different tool sets:
+
+| Role | Available Tools |
+|------|----------------|
+| **planner** | Full tool set - can create executions, manage tasks, control workflow |
+| **worker** | Limited set - can report status, use mail, edit files |
+| **merger** | Minimal set - only basic tools for conflict resolution |
+
+The coordinator runs as a planner with full orchestration capabilities. Workers get a restricted toolset focused on execution.
+
+## Signal File Architecture
+
+Tools don't directly modify the orchestrator state. Instead:
+
+1. **Tool writes signal file**: Each tool call writes a JSON signal to `.enki/events/sig-*.json`
+2. **Coordinator polls**: The coordinator polls the events directory every 3 seconds
+3. **Coordinator reacts**: On each tick, it processes signal files and updates orchestrator state
+4. **File cleanup**: After processing, signal files are deleted
+
+This architecture decouples tool calls from state mutations, enabling:
+- **Atomic state updates** in the coordinator thread
+- **No locks** between worker processes and coordinator
+- **Simple debugging** via signal file inspection
+- **Crash recovery** from unprocessed signals
+
+## Signal File Format
+
+Example signal file created by `enki_task_create`:
+
+```json
+{
+  "type": "task_created",
+  "task_id": "task-01JXXX..."
+}
+```
+
+Example signal file created by `enki_execution_create`:
+
+```json
+{
+  "type": "execution_created",
+  "execution_id": "exec-01JYYY..."
+}
+```
+
+The coordinator's event processing loop:
+
+```
+loop (every 3s tick):
+  1. Read all signal files from .enki/events/
+  2. Parse JSON and convert to internal Event enum
+  3. Pass events to orchestrator.process_events()
+  4. Delete processed signal files
+  5. Spawn/kill workers based on orchestrator output
+```
+
+## Event Cascade
+
+The orchestrator's `process_events()` method can produce new events as side effects. For example:
+
+- Spawning a worker may fail (infra issue) → produces `WorkerSpawnFailed` event
+- A merge conflict → produces `MergeNeedsResolution` event → spawns merger agent
+- A checkpoint completes → produces `ExecutionPaused` event
+
+The coordinator drains events in a `while !events.is_empty()` loop to handle cascades.
+
+## Environment Context
+
+All MCP tools run within the context of environment variables:
+
+| Variable | Purpose |
+|----------|--------|
+| `ENKI_BIN` | Path to enki binary (for spawning workers) |
+| `ENKI_DIR` | Project `.enki/` directory path |
+| `ENKI_SESSION_ID` | Current session ID (scopes task lists) |
+| `CLAUDECODE` | Cleared to prevent nested sessions |
+
+Worker agents inherit these variables and see only tasks within their session scope.
+
+## Error Handling
+
+Tool calls return errors as JSON-RPC error responses:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32000,
+    "message": "missing required parameter: title"
+  }
+}
+```
+
+Common error scenarios:
+- **Missing parameters**: Required fields not provided
+- **Invalid IDs**: Task/execution ID not found or malformed
+- **State conflicts**: Trying to retry a non-failed task, resume a running execution, etc.
+- **Infra failures**: File system errors writing signal files or reading database
+
+## Tool Categories
+
+Enki's MCP tools are organized into functional categories:
+
+- [Task Management](/api/tools/task-management) - Create and list standalone tasks
+- [Execution Control](/api/tools/execution-control) - Multi-step workflows with dependencies
+- **Mail System** - Inter-agent messaging (coordinator ↔ workers ↔ user)
+- **File Operations** - Hashline-based editing with conflict detection
+- **Worker Reporting** - Activity status updates for TUI display
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Task Management" icon="list-check" href="/api/tools/task-management">
+    Create standalone tasks and check system status
+  </Card>
+  <Card title="Execution Control" icon="diagram-project" href="/api/tools/execution-control">
+    Build multi-step workflows with dependencies and checkpoints
+  </Card>
+</CardGroup>

@@ -1,0 +1,320 @@
+---
+title: Logs
+description: Understanding Enki's logging system and how to use logs for debugging
+---
+
+Enki maintains detailed logs to help you debug issues and understand what's happening in your orchestration workflows.
+
+## Log Files
+
+### Main Log: `~/.enki/logs/enki.log`
+
+The primary log file for the Enki TUI process. This is where you'll find lifecycle events, errors, warnings, and debug information.
+
+<Note>
+  When the user mentions "the logs" or "check the logs", this is the file to read.
+  The most recent session is always at the bottom of the file.
+</Note>
+
+**Location**: `~/.enki/logs/enki.log`
+
+**Format**: Plain text with timestamps and log levels
+
+**Session separators**:
+```
+══════════════════ SESSION START ══════════════════
+```
+
+Each time you start the Enki TUI, a new session separator is written. This makes it easy to isolate logs from different runs.
+
+### Per-Agent Session Logs: `~/.enki/logs/sessions/<label>.log`
+
+Each spawned ACP agent (worker, planner, merger) gets its own session log containing timestamped JSON-RPC traffic.
+
+**Location**: `~/.enki/logs/sessions/<label>.log`
+
+**Contents**:
+- JSON-RPC requests and responses
+- Tool invocations (MCP protocol)
+- Agent reasoning and outputs
+- Subprocess communication
+
+**Example label format**: `worker-task-abc123.log`, `planner-main.log`, `merger-conflict-xyz.log`
+
+## Log Levels
+
+Enki uses standard log levels to categorize messages:
+
+| Level | Purpose | Examples |
+|-------|---------|----------|
+| **ERROR** | Failures and critical issues | Worker spawn failed, merge conflict, database error |
+| **WARN** | Warnings that don't stop execution | Stale worker detected, retry attempt, deprecated feature |
+| **INFO** | Lifecycle events | Session started, task created, worker completed, merge landed |
+| **DEBUG** | Detailed diagnostic information | Subprocess args, copy paths, prompt sizes, session kills, signal processing |
+
+### Default Log Levels
+
+**TUI mode** (`enki`):
+```rust
+tracing_subscriber::EnvFilter::new("enki=debug,enki_core=debug,enki_acp=debug")
+```
+
+All crates log at `DEBUG` level by default when running the TUI.
+
+**Non-TUI mode** (`enki mcp`):
+```rust
+tracing_subscriber::EnvFilter::from_default_env()
+    .add_directive("enki=info".parse().unwrap())
+```
+
+MCP server logs at `INFO` level to stderr (doesn't interfere with JSON-RPC stdio).
+
+### Overriding Log Levels
+
+Use the `RUST_LOG` environment variable:
+
+```bash
+# More verbose
+RUST_LOG=enki=trace enki
+
+# Less verbose
+RUST_LOG=enki=warn enki
+
+# Fine-grained control
+RUST_LOG=enki=debug,enki_core=trace,enki_acp=info enki
+```
+
+## Reading Logs
+
+### Quick Commands
+
+```bash
+# View the end of the most recent session (last 200 lines)
+tail -n 200 ~/.enki/logs/enki.log
+
+# Find all errors and warnings
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+
+# Watch logs in real-time
+tail -f ~/.enki/logs/enki.log
+
+# Errors from the current session only
+awk '/SESSION START/{p++} p==NR{print}' ~/.enki/logs/enki.log | grep ERROR
+
+# Count errors by type
+grep ERROR ~/.enki/logs/enki.log | sort | uniq -c | sort -rn
+```
+
+### Finding Recent Sessions
+
+```bash
+# List all session starts with line numbers
+grep -n "SESSION START" ~/.enki/logs/enki.log
+
+# Extract just the most recent session
+awk '/SESSION START/{buf=""} {buf=buf"\n"$0} END{print buf}' ~/.enki/logs/enki.log
+
+# Get the 2nd most recent session
+awk '/SESSION START/{if(count++)buf=next_buf; next_buf=""} {next_buf=next_buf"\n"$0} END{print buf}' ~/.enki/logs/enki.log
+```
+
+### Reading Session Logs (JSON-RPC Traffic)
+
+Session logs contain raw JSON-RPC communication. They're useful for debugging:
+- What tools agents are calling
+- What parameters they're passing
+- Response data and errors
+- Agent reasoning (in message content)
+
+```bash
+# List all session logs
+ls -lh ~/.enki/logs/sessions/
+
+# Pretty-print JSON-RPC messages
+jq . ~/.enki/logs/sessions/worker-*.log
+
+# Extract only tool calls
+grep '"method"' ~/.enki/logs/sessions/*.log
+
+# Find specific tool invocations
+grep 'enki_task_create' ~/.enki/logs/sessions/planner-*.log
+```
+
+## Common Log Patterns
+
+### Worker Lifecycle
+
+```
+INFO  enki::coordinator: Spawning worker for task task-abc123
+DEBUG enki_acp: Starting ACP session: ["claude", "--model", "claude-sonnet-4-20250514", ...]
+DEBUG enki::coordinator: Created copy at .enki/copies/task-abc123
+INFO  enki::coordinator: Worker session started: session-xyz789
+...
+INFO  enki::coordinator: Worker completed: task-abc123
+DEBUG enki_core::refinery: Queuing merge for task-abc123, branch task/abc123
+INFO  enki_core::refinery: Merge landed for task-abc123
+```
+
+### Errors to Watch For
+
+**Copy failures** (triggers `infra_broken` flag):
+```
+ERROR enki::coordinator: Failed to create worker copy: Os { code: 28, kind: StorageFull, message: "No space left on device" }
+WARN  enki::coordinator: Setting infra_broken flag, will fail all future spawns
+```
+
+**Stale worker cancellation**:
+```
+WARN  enki_core::monitor: Worker task-abc123 has been stale for 120s, cancelling
+INFO  enki::coordinator: Killing session session-xyz789 due to monitor timeout
+```
+
+**Merge conflicts**:
+```
+WARN  enki_core::refinery: Merge conflict for task-abc123, spawning merger agent
+INFO  enki::coordinator: Spawning merger session for conflict resolution
+```
+
+**Database issues**:
+```
+ERROR enki::db: Failed to open database: SqliteFailure(Error { code: DatabaseCorrupt, extended_code: 11 }, Some("database disk image is malformed"))
+```
+
+### Signal Processing
+
+```
+DEBUG enki::coordinator: Checking for signal files in .enki/events/
+DEBUG enki::coordinator: Found signal: sig-01JEXAMPLE.json (type: task_created)
+INFO  enki::coordinator: Processing task_created signal for task-abc123
+DEBUG enki::coordinator: Deleted signal file sig-01JEXAMPLE.json
+```
+
+## Debugging Workflows
+
+### Diagnosing Worker Failures
+
+1. **Find the error in main log**:
+   ```bash
+   grep "ERROR" ~/.enki/logs/enki.log | grep task-abc123
+   ```
+
+2. **Check worker session log**:
+   ```bash
+   cat ~/.enki/logs/sessions/*task-abc123.log
+   ```
+
+3. **Look for spawn issues**:
+   ```bash
+   grep "spawn" ~/.enki/logs/enki.log | tail -n 20
+   ```
+
+### Investigating Merge Issues
+
+1. **Find merge events**:
+   ```bash
+   grep "merge\|Merge" ~/.enki/logs/enki.log | tail -n 50
+   ```
+
+2. **Check merger session** (if conflict):
+   ```bash
+   ls ~/.enki/logs/sessions/ | grep merger
+   cat ~/.enki/logs/sessions/merger-*.log
+   ```
+
+3. **Inspect git state**:
+   ```bash
+   git log --oneline --graph --all | grep task/
+   ```
+
+### Tracking Signal Processing
+
+1. **Watch for signal files**:
+   ```bash
+   ls -la .enki/events/
+   ```
+
+2. **Monitor coordinator tick**:
+   ```bash
+   tail -f ~/.enki/logs/enki.log | grep "CheckSignals\|signal"
+   ```
+
+3. **Verify MCP writes**:
+   ```bash
+   # Check if MCP server is writing signals
+   cat ~/.enki/logs/sessions/planner-*.log | grep "enki_task_create"
+   ```
+
+## Log Retention
+
+<Warning>
+  Enki does NOT automatically rotate or clean up logs. Over time, `enki.log` and session logs can grow large.
+</Warning>
+
+### Manual Cleanup
+
+```bash
+# Archive old main log
+mv ~/.enki/logs/enki.log ~/.enki/logs/enki.log.$(date +%Y%m%d)
+
+# Remove session logs older than 7 days
+find ~/.enki/logs/sessions/ -name "*.log" -mtime +7 -delete
+
+# Keep only last 1000 lines of main log
+tail -n 1000 ~/.enki/logs/enki.log > ~/.enki/logs/enki.log.tmp
+mv ~/.enki/logs/enki.log.tmp ~/.enki/logs/enki.log
+```
+
+## Advanced: Log Implementation Details
+
+### TUI Mode Logging
+
+From `crates/cli/src/main.rs:77-113`:
+
+```rust
+fn init_logging(is_tui: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    if is_tui {
+        let log_dir = commands::global_dir().join("logs");
+        std::fs::create_dir_all(&log_dir).ok();
+
+        let file_appender = tracing_appender::rolling::never(&log_dir, "enki.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_ansi(false)  // No color codes in file
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("enki=debug,enki_core=debug,enki_acp=debug")
+                }),
+            )
+            .init();
+
+        tracing::info!("══════════════════ SESSION START ══════════════════");
+        Some(guard)
+    } else {
+        // MCP mode: log to stderr
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("enki=info".parse().unwrap()),
+            )
+            .init();
+        None
+    }
+}
+```
+
+**Key points**:
+- `rolling::never` = append to same file, no rotation
+- `non_blocking` = background writer thread (guard must stay alive)
+- `with_ansi(false)` = no color codes (clean for `grep`)
+- Session separator written immediately after init
+
+### Why No ANSI in TUI Logs
+
+TUI mode disables ANSI color codes in the log file (`.with_ansi(false)`) because:
+- Raw mode terminal would be corrupted by stderr output
+- Color codes make `grep` and parsing difficult
+- File logs are for machine/human reading later, not real-time display
+
+The TUI streams agent outputs separately through its own rendering pipeline.

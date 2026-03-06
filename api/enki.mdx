@@ -1,0 +1,131 @@
+---
+title: 'enki'
+description: 'Launch the Enki TUI interface'
+---
+
+## Command Signature
+
+```bash
+enki
+```
+
+## Description
+
+Running `enki` with no arguments launches the interactive Terminal User Interface (TUI). This is the primary way to interact with Enki's multi-agent orchestration system.
+
+## Behavior
+
+### Auto-Initialization
+
+When you run `enki` for the first time in a project directory, it automatically initializes the project structure:
+
+- Creates `.enki/` directory if it doesn't exist
+- Initializes SQLite database (`db.sqlite`) in WAL mode
+- Sets up event signal file directory (`.enki/events/`)
+- Creates logs directory (`~/.enki/logs/`)
+
+If initialization fails, the command exits with code 1 and prints an error message to stderr.
+
+### Logging
+
+In TUI mode, all logs are written to file instead of stderr (which would corrupt the raw-mode terminal):
+
+- **Log file location**: `~/.enki/logs/enki.log`
+- **Log level**: `debug` for `enki`, `enki_core`, and `enki_acp` modules (configurable via `RUST_LOG` environment variable)
+- **Session markers**: Each TUI session begins with `══════════════════ SESSION START ══════════════════`
+- **Format**: Plain text (ANSI disabled for clean file output)
+
+### Startup Process
+
+1. Resolves the `enki` binary path via `std::env::current_exe()` and sets `ENKI_BIN` environment variable
+2. Auto-initializes project if needed (creates `.enki/` structure)
+3. Opens the SQLite database connection
+4. Launches the TUI coordinator loop with:
+   - Dedicated OS thread running a `current_thread` tokio runtime
+   - `LocalSet` for managing `!Send` ACP agent state
+   - 3-second tick interval for polling signal files
+
+## Exit Codes
+
+- **0**: Normal exit (user quit the TUI)
+- **1**: Error during initialization, database connection, or TUI runtime
+
+## Examples
+
+### Basic Usage
+
+```bash
+# Launch the TUI in the current project directory
+enki
+```
+
+### First-Time Initialization
+
+```bash
+$ cd /path/to/your/project
+$ enki
+# Creates .enki/ directory structure automatically
+# Launches TUI interface
+```
+
+### Viewing Logs
+
+```bash
+# View the most recent session
+tail -n 200 ~/.enki/logs/enki.log
+
+# Search for errors and warnings
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+
+# View all sessions
+cat ~/.enki/logs/enki.log
+```
+
+## Environment Variables
+
+### Set by Enki
+
+These variables are automatically set when running `enki`:
+
+- **`ENKI_BIN`**: Absolute path to the `enki` binary (injected into all spawned agent subprocesses)
+- **`ENKI_DIR`**: Path to the project's `.enki/` directory
+
+### Respected by Enki
+
+- **`RUST_LOG`**: Controls log filtering (default: `enki=debug,enki_core=debug,enki_acp=debug`)
+
+## Project Structure
+
+After running `enki`, your project will have:
+
+```
+.enki/
+├── db.sqlite          # SQLite database (WAL mode), stores DAG and execution state
+├── db.sqlite-wal      # Write-ahead log file
+├── db.sqlite-shm      # Shared memory file
+├── roles/             # Project-specific role overrides (*.toml)
+├── artifacts/         # Artifact output mode files (<exec>/<step>.md)
+└── events/            # Signal files for IPC (sig-*.json)
+```
+
+Global logs and configuration:
+
+```
+~/.enki/
+├── logs/
+│   ├── enki.log              # Main TUI session logs
+│   └── sessions/             # Per-agent JSON-RPC traffic logs
+│       └── <label>.log
+└── roles/                     # Global role definitions (*.toml)
+```
+
+## Notes
+
+- The TUI uses raw `crossterm` (not ratatui) with a custom canvas implementation
+- Database uses WAL mode for better concurrency between reader and writer
+- The coordinator polls signal files every 3 seconds instead of using filesystem notifications
+- The `CLAUDECODE` environment variable is cleared when spawning agents to prevent nested-session refusal
+
+## See Also
+
+- [enki mcp](/api/enki-mcp) - MCP stdio server for ACP agents

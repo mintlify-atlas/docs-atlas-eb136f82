@@ -1,0 +1,287 @@
+---
+title: Common Issues
+description: Troubleshooting common problems when using Enki
+---
+
+This guide covers the most frequently encountered issues and their solutions.
+
+## Quick Diagnostics
+
+Before diving into specific issues, check:
+
+1. **Main log file**: `~/.enki/logs/enki.log` (most recent session at bottom)
+2. **Error messages**: `grep "ERROR\|WARN" ~/.enki/logs/enki.log`
+3. **Session-specific logs**: `~/.enki/logs/sessions/<label>.log`
+
+See [Logs](/troubleshooting/logs) for detailed log information.
+
+## Common Problems
+
+<AccordionGroup>
+  <Accordion title="Workers not starting or failing immediately">
+    **Symptoms**: Tasks stuck in "Pending" or immediately fail after spawn
+
+    **Common causes**:
+
+    1. **Missing Claude Code installation**
+       - Workers are spawned as ACP (Agent Client Protocol) subprocesses
+       - Verify Claude Code is installed and accessible
+       - Check `DEBUG` logs for subprocess spawn errors
+
+    2. **Node.js not available**
+       - Some ACP agents require Node.js runtime
+       - Verify: `node --version`
+
+    3. **Infrastructure broken flag set**
+       - If a `cp` command fails during worker spawn, the `infra_broken` flag is set
+       - All subsequent spawns auto-fail to avoid repeated errors
+       - Check logs for "copy failed" or "infra_broken" messages
+       - Solution: Fix the underlying issue (disk space, permissions) and restart Enki
+
+    **Check the logs**:
+    ```bash
+    # Look for spawn failures
+    grep "spawn" ~/.enki/logs/enki.log | tail -n 50
+    
+    # Check for copy errors
+    grep "copy\|infra_broken" ~/.enki/logs/enki.log
+    ```
+  </Accordion>
+
+  <Accordion title="Merge conflicts during task completion">
+    **Symptoms**: Worker completes successfully but merge fails, task enters Failed state
+
+    **What happens**:
+    - When a worker completes, Enki fetches its `task/<id>` branch from the worker's copy
+    - The refinery attempts to merge it into your main branch
+    - If there's a conflict, Enki spawns a **merger agent** with minimal tools to resolve it
+
+    **Merger agent flow**:
+    1. Conflict detected → `MergeNeedsResolution` event
+    2. Separate ACP session spawned with `MERGER_TOOLS` (minimal tool access)
+    3. Works in a shared temp clone (kept alive via `CleanupGuard` + `std::mem::forget`)
+    4. Agent resolves conflict and commits
+    5. Merge completes → `MergeDone` advances the DAG
+
+    **If merger fails**:
+    - Check `.enki/verify.sh` hook (if present) — non-zero exit fails the merge
+    - Review merge request logs in the database
+    - Check session logs: `~/.enki/logs/sessions/<merger-session>.log`
+
+    **Manual resolution**:
+    ```bash
+    # Check pending merge requests
+    sqlite3 .enki/db.sqlite "SELECT * FROM merge_requests WHERE status='pending';"
+    
+    # Inspect the branch
+    git log task/<id>
+    git diff main...task/<id>
+    ```
+  </Accordion>
+
+  <Accordion title="Copy-on-Write failures">
+    **Symptoms**: "copy failed" errors, workers not getting isolated copies
+
+    **About CoW copies**:
+    - Each worker gets a full filesystem copy at `.enki/copies/<task_id>/`
+    - Uses platform-specific CoW for instant, space-efficient clones:
+      - macOS/APFS: `cp -Rc`
+      - Linux: `cp --reflink=auto -a`
+    - Excludes `.enki/` from copies
+
+    **Common causes**:
+
+    1. **Insufficient disk space**
+       - Even with CoW, metadata and unique files consume space
+       - Check: `df -h`
+
+    2. **Filesystem doesn't support CoW**
+       - Linux: Requires btrfs or XFS (with recent kernel)
+       - macOS: Requires APFS
+       - On unsupported filesystems, falls back to full copy (slow + space-heavy)
+
+    3. **Permission issues**
+       - Check `.enki/copies/` directory permissions
+       - Ensure user can write to project directory
+
+    **Fix**:
+    ```bash
+    # Check filesystem type
+    df -T .  # Linux
+    diskutil info / | grep "File System"  # macOS
+    
+    # Clean up old copies if space is low
+    rm -rf .enki/copies/task-*
+    
+    # Restart Enki to clear infra_broken flag
+    ```
+  </Accordion>
+
+  <Accordion title="Stale workers / timeout issues">
+    **Symptoms**: Workers appear stuck, no progress for extended period
+
+    **How monitoring works**:
+    - The Monitor state machine tracks worker activity via ACP updates
+    - Workers with no update for `STALE_CANCEL_SECS` get cancelled:
+      - Standard tier: 120 seconds default
+    - Retry budget: up to 3 retries per task (`MAX_TASK_RETRIES`)
+    - After max retries, task blocks to prevent infinite loops
+
+    **Check worker activity**:
+    ```bash
+    # Recent worker activity in logs
+    tail -n 200 ~/.enki/logs/enki.log | grep "worker\|session"
+    
+    # Session-specific activity (JSON-RPC traffic)
+    cat ~/.enki/logs/sessions/<label>.log
+    ```
+
+    **If workers are genuinely stuck**:
+    - Use MCP `enki_stop_all` tool to cancel all running workers
+    - Check for deadlocks in session logs
+    - Review task complexity tier assignment (heavy tasks get more time)
+
+    **Manual intervention**:
+    ```bash
+    # Stop all workers via database
+    sqlite3 .enki/db.sqlite "UPDATE tasks SET status='Cancelled' WHERE status='Running';"
+    
+    # Restart Enki
+    ```
+  </Accordion>
+
+  <Accordion title="Database corruption or state issues">
+    **Symptoms**: Crashes on startup, inconsistent task states, migration errors
+
+    **Database details**:
+    - SQLite in WAL mode: `.enki/db.sqlite`
+    - DAG stored as JSON blob in `executions` table
+    - Auto-migration on every DB open (no version files)
+
+    **Recovery steps**:
+
+    1. **Backup first**:
+       ```bash
+       cp .enki/db.sqlite .enki/db.sqlite.backup
+       ```
+
+    2. **Check integrity**:
+       ```bash
+       sqlite3 .enki/db.sqlite "PRAGMA integrity_check;"
+       ```
+
+    3. **If corrupted, re-initialize** (destroys task history):
+       ```bash
+       rm .enki/db.sqlite
+       rm .enki/db.sqlite-shm
+       rm .enki/db.sqlite-wal
+       # Restart Enki — will auto-create fresh DB
+       ```
+
+    4. **Abandoned tasks** (DB-only state):
+       - Set on session exit for in-flight tasks
+       - Never enters the DAG runtime
+       - Safe to ignore or manually clean up:
+         ```bash
+         sqlite3 .enki/db.sqlite "DELETE FROM tasks WHERE status='Abandoned';"
+         ```
+  </Accordion>
+
+  <Accordion title="Permission denied errors">
+    **Symptoms**: "Permission denied" when accessing files, creating copies, or running workers
+
+    **Common causes**:
+
+    1. **Project directory permissions**
+       - Enki needs write access to `.enki/` subdirectory
+       - Check: `ls -la .enki/`
+
+    2. **Worker copy permissions**
+       - CoW copies preserve original file permissions
+       - If source files are read-only for the user, workers can't modify them
+
+    3. **Git repository permissions**
+       - Workers create branches and commits
+       - Check: `git config user.name && git config user.email`
+
+    **Fix**:
+    ```bash
+    # Ensure .enki/ is writable
+    chmod -R u+w .enki/
+    
+    # Check git config
+    git config --list | grep user
+    
+    # Fix git identity if needed
+    git config user.name "Your Name"
+    git config user.email "you@example.com"
+    ```
+  </Accordion>
+
+  <Accordion title="Signal file processing issues">
+    **Symptoms**: MCP tool calls succeed but nothing happens, tasks don't start
+
+    **How signals work**:
+    - MCP server writes `.enki/events/sig-*.json` files
+    - Coordinator polls on 3-second tick and processes them
+    - Files are deleted after processing
+    - No filesystem notifications (no `fsnotify`)
+
+    **Debug**:
+    ```bash
+    # Check for stuck signal files
+    ls -la .enki/events/
+    
+    # Watch signal processing in real-time
+    tail -f ~/.enki/logs/enki.log | grep "signal\|CheckSignals"
+    
+    # Manually inspect a signal file
+    cat .enki/events/sig-*.json
+    ```
+
+    **Common issues**:
+    - Coordinator not running (TUI exited)
+    - Permission issues on `.enki/events/` directory
+    - Malformed JSON in signal file (MCP server bug)
+
+    **Fix**:
+    ```bash
+    # Clean up stuck signals
+    rm .enki/events/sig-*.json
+    
+    # Restart Enki TUI
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Still Having Issues?
+
+<Warning>
+  If problems persist after trying these solutions:
+  
+  1. Collect full logs: `~/.enki/logs/enki.log` and session logs
+  2. Check database state: `sqlite3 .enki/db.sqlite ".schema"` and `SELECT * FROM tasks;`
+  3. Report the issue with logs and reproduction steps
+</Warning>
+
+### Useful Diagnostic Commands
+
+```bash
+# Full system state
+sqlite3 .enki/db.sqlite <<EOF
+SELECT 'Tasks:' as section, status, COUNT(*) FROM tasks GROUP BY status
+UNION ALL
+SELECT 'Executions:', status, COUNT(*) FROM executions GROUP BY status
+UNION ALL  
+SELECT 'Merge Requests:', status, COUNT(*) FROM merge_requests GROUP BY status;
+EOF
+
+# Recent errors
+grep "ERROR" ~/.enki/logs/enki.log | tail -n 20
+
+# Active sessions
+sqlite3 .enki/db.sqlite "SELECT id, started_at FROM sessions WHERE ended_at IS NULL;"
+
+# Worker copies on disk
+du -sh .enki/copies/*
+```

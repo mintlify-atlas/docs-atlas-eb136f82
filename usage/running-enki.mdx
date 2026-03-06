@@ -1,0 +1,142 @@
+---
+title: "Running Enki"
+description: "Launch the TUI and understand the project initialization process"
+---
+
+## Starting Enki
+
+Run the `enki` command with no arguments to launch the Terminal User Interface (TUI):
+
+```bash
+enki
+```
+
+The TUI provides a chat interface where you interact with the coordinator agent to manage your multi-agent coding workflows.
+
+## First Run: Auto-Initialization
+
+When you run `enki` for the first time in a project directory, it automatically initializes the project by creating the `.enki/` directory structure:
+
+```
+.enki/
+├── db.sqlite          # SQLite database (WAL mode) storing tasks, executions, and state
+├── copies/            # Filesystem copies for worker isolation (created on demand)
+├── events/            # Signal files for cross-process communication
+├── roles/             # Project-specific role configuration overrides (optional)
+├── artifacts/         # Markdown artifacts from research/analysis workers
+│   └── <exec-id>/
+│       └── <step>.md
+└── logs/              # Session and debug logs
+```
+
+<Info>
+The `.enki/` directory is created in your project root. You may want to add `.enki/copies/` and `.enki/logs/` to your `.gitignore` to avoid committing temporary worker files and logs.
+</Info>
+
+## Environment Variables
+
+Enki uses several environment variables internally for coordination between processes:
+
+| Variable | Purpose |
+|----------|----------|
+| `ENKI_BIN` | Path to the enki binary, injected into all spawned agent subprocesses |
+| `ENKI_DIR` | Absolute path to the project's `.enki/` directory |
+| `ENKI_SESSION_ID` | Unique session identifier scoping MCP tool results to the current session |
+| `CLAUDECODE` | Cleared on agent spawn to prevent nested-session refusal |
+
+<Tip>
+These variables are set automatically by enki—you don't need to configure them manually. They're documented here for debugging purposes.
+</Tip>
+
+## Project Directory Structure
+
+### Database (`db.sqlite`)
+
+The SQLite database (using WAL mode for better concurrency) stores:
+
+- **Sessions**: Each TUI launch creates a new session with a unique ID
+- **Tasks**: Individual units of work with status, tier, branch info, and assignment details
+- **Executions**: Multi-step workflows with dependency graphs (DAG)
+- **Merge requests**: Queued, in-progress, and completed merge operations
+- **Task outputs**: Summary text from completed workers, passed to dependent steps
+- **Messages**: Inter-agent mail for coordination and escalation
+
+### Worker Copies (`copies/`)
+
+Each worker agent runs in an isolated filesystem copy of your project at `.enki/copies/<task-id>/`. These copies use platform-appropriate copy-on-write techniques:
+
+- **macOS/APFS**: `cp -Rc` (clonefile)
+- **Linux/btrfs**: `cp --reflink=auto -a`
+
+Copies include everything from your project directory (build artifacts, node_modules, .gitignored files) so workers start with a warm build cache. The `.enki/` directory itself is excluded from copies.
+
+### Signal Files (`events/`)
+
+The MCP server (running in separate agent processes) communicates with the coordinator via JSON signal files written to `.enki/events/sig-*.json`. The coordinator's 3-second tick loop polls this directory, processes signals, and deletes them. This simple file-based IPC avoids the complexity of fsnotify.
+
+### Role Overrides (`roles/`)
+
+Optional project-specific role configuration files in TOML format. Roles load in cascade:
+
+1. Built-in roles (bundled with enki)
+2. Global user roles (`~/.enki/roles/*.toml`)
+3. Project-specific roles (`.enki/roles/*.toml`)
+
+See [Agent Roles](/concepts/roles) for details on customizing roles.
+
+### Artifacts (`artifacts/`)
+
+Markdown reports produced by research and analysis workers. When a step uses a role with `output = "artifact"` (like `researcher` or `code_referencer`), the worker creates a markdown file at:
+
+```
+.enki/artifacts/<execution-id>/<step-id>.md
+```
+
+Artifacts are automatically discovered and made available as context to downstream steps in the same execution.
+
+## Logs
+
+### Main Session Log
+
+When running the TUI, logs are written to `~/.enki/logs/enki.log` (not in your project directory—this is a global user location). Sessions are separated by banner lines:
+
+```
+══════════════════ SESSION START ══════════════════
+```
+
+The most recent session is at the bottom of the file.
+
+**Viewing recent activity:**
+
+```bash
+tail -n 200 ~/.enki/logs/enki.log
+```
+
+**Finding errors:**
+
+```bash
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+```
+
+### Per-Agent Session Logs
+
+Each agent session (coordinator, workers, merger agents) has its own detailed log at:
+
+```
+~/.enki/logs/sessions/<label>.log
+```
+
+These logs contain timestamped JSON-RPC traffic between the TUI/coordinator and the ACP agent processes. They're useful for debugging agent behavior and failures.
+
+<Info>
+Log levels: `ERROR` = failures, `INFO` = lifecycle events (session start, task spawn, merge status), `DEBUG` = subprocess arguments, copy paths, prompt sizes, session kills.
+</Info>
+
+## Exiting Enki
+
+To exit the TUI:
+
+1. Press `Ctrl+C` twice within 5 seconds
+2. Or type your quit command and confirm
+
+On exit, the session is marked as ended in the database, and any in-flight tasks are marked as `abandoned` (a database-only status that prevents orphaned work from blocking future sessions).

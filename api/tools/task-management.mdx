@@ -1,0 +1,266 @@
+---
+title: Task Management Tools
+description: Create standalone tasks and query orchestrator status
+---
+
+Task management tools handle simple, standalone work items. For multi-step workflows with dependencies, use [execution control tools](/api/tools/execution-control) instead.
+
+## enki_task_create
+
+Create a single standalone task with no dependencies. Tasks start with status `pending` and are automatically picked up by available worker agents based on tier capacity.
+
+<Note>
+  For work involving 2+ related steps or dependencies, use `enki_execution_create` instead.
+</Note>
+
+### Input Schema
+
+<ParamField path="title" type="string" required>
+  Short task title (e.g., "Fix navigation bug", "Add user authentication")
+</ParamField>
+
+<ParamField path="description" type="string">
+  Detailed task description with acceptance criteria. Provide enough context for a worker agent to complete the task independently.
+</ParamField>
+
+<ParamField path="tier" type="string" default="standard">
+  Complexity tier that determines worker capacity allocation.
+  
+  **Allowed values:**
+  - `light` - Simple tasks (3 concurrent per worker pool)
+  - `standard` - Normal complexity (2 concurrent)
+  - `heavy` - Complex tasks (1 concurrent, default)
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 1,
+  "params": {
+    "name": "enki_task_create",
+    "arguments": {
+      "title": "Add rate limiting middleware",
+      "description": "Implement Express middleware for API rate limiting. Requirements:\n- 100 requests per minute per IP\n- Redis-backed counter\n- Custom header with remaining quota\n- Tests with >90% coverage",
+      "tier": "standard"
+    }
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Success message with task ID and status.
+      
+      Example: `Created task 'Add rate limiting middleware' (task-01JXX...) — status: ready, tier: standard`
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Signal File Written
+
+```json
+{
+  "type": "task_created",
+  "task_id": "task-01JXX..."
+}
+```
+
+The coordinator polls this signal file, creates a worker session, and spawns an agent to execute the task.
+
+---
+
+## enki_task_list
+
+List all tasks in the current session, showing ID, status, tier, and title. If `ENKI_SESSION_ID` is set, only tasks from that session are shown.
+
+### Input Schema
+
+No parameters.
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 2,
+  "params": {
+    "name": "enki_task_list",
+    "arguments": {}
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      List of tasks in format:
+      ```
+      <short_id> | <status> | <tier> | <title> [activity]
+      ```
+      
+      Example:
+      ```
+      a1b2 | running | standard | Add rate limiting [implementing middleware]
+      c3d4 | done | light | Update README
+      e5f6 | failed | heavy | Refactor auth system
+      ```
+      
+      Returns `"No tasks."` if the session has no tasks.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+### Task Statuses
+
+| Status | Meaning |
+|--------|--------|
+| `pending` | Task is ready to be picked up by a worker |
+| `running` | Worker is actively executing the task |
+| `done` | Task completed successfully and merged |
+| `failed` | Worker reported failure or merge failed |
+| `blocked` | Dependency failed, task cannot proceed |
+| `abandoned` | Session ended while task was in-flight |
+
+---
+
+## enki_status
+
+Show summary counts of tasks by status. Useful for quick health checks and progress monitoring.
+
+### Input Schema
+
+No parameters.
+
+### Request Example
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "id": 3,
+  "params": {
+    "name": "enki_status",
+    "arguments": {}
+  }
+}
+```
+
+### Response
+
+<ResponseField name="content" type="array">
+  <Expandable title="array items">
+    <ResponseField name="type" type="string" default="text">
+      Always `"text"`
+    </ResponseField>
+    <ResponseField name="text" type="string">
+      Summary line with counts:
+      ```
+      tasks: 2 pending, 3 running, 15 done, 1 failed (21 total)
+      ```
+      
+      Failed count includes both `failed` and `blocked` tasks.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Usage Patterns
+
+### Creating a Simple Task
+
+```python
+# Planner agent creates a standalone task
+result = await call_tool(
+    "enki_task_create",
+    title="Fix navigation bug",
+    description="The sidebar navigation doesn't highlight the current page. Fix the active state logic."
+)
+# Result: Created task 'Fix navigation bug' (task-a1b2) — status: ready, tier: heavy
+```
+
+### Monitoring Progress
+
+```python
+# Check overall system status
+status = await call_tool("enki_status")
+# Result: tasks: 1 pending, 0 running, 0 done, 0 failed (1 total)
+
+# List all tasks for details
+tasks = await call_tool("enki_task_list")
+# Result:
+# a1b2 | running | heavy | Fix navigation bug [analyzing codebase]
+```
+
+### When to Use Task Management vs Execution Control
+
+**Use `enki_task_create` when:**
+- Single, independent piece of work
+- No dependencies on other tasks
+- No need for checkpoints or review points
+- Examples: "Fix typo in README", "Add logging to auth endpoint"
+
+**Use `enki_execution_create` when:**
+- Multiple related steps
+- Steps have dependencies (A must finish before B)
+- Need checkpoints for review/approval
+- Want fine-grained control over parallelism
+- Examples: "Build new feature", "Large refactoring", "Multi-stage deployment"
+
+---
+
+## Error Handling
+
+### Missing Required Field
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32000,
+    "message": "missing required parameter: title"
+  }
+}
+```
+
+### Invalid Tier
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32000,
+    "message": "invalid tier: ultra (must be light, standard, or heavy)"
+  }
+}
+```
+
+### Database Access Failure
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32000,
+    "message": "database error: unable to open .enki/db.sqlite"
+  }
+}
+```

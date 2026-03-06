@@ -1,0 +1,430 @@
+---
+title: 'Testing'
+description: 'Testing strategies, patterns, and debugging techniques for Enki development'
+---
+
+## Testing Approach
+
+Enki's testing strategy focuses on **inline unit and integration tests** within the `core` crate, where the bulk of the orchestration logic lives. The synchronous state machine design makes the code highly testable.
+
+### Philosophy
+
+- **State machines are trivially testable**: Every method is `fn handle(&mut self, cmd) -> Vec<Event>`
+- **No mocking required**: Pure functions with explicit inputs and outputs
+- **Integration tests verify workflows**: Multi-step scenarios test the command/event cascade
+
+## Running Tests
+
+### Core Crate Tests
+
+The `enki-core` crate contains the majority of tests:
+
+```bash
+# Run all core tests
+cargo test -p enki-core
+
+# Run tests with output visible
+cargo test -p enki-core -- --nocapture
+
+# Run a specific test
+cargo test -p enki-core test_orchestrator_spawn_worker
+
+# Run tests matching a pattern
+cargo test -p enki-core orchestrator
+```
+
+### Per-Crate Testing
+
+```bash
+# Test the ACP client
+cargo test -p enki-acp
+
+# Test the TUI library
+cargo test -p enki-tui
+
+# Test the CLI binary
+cargo test -p enki-cli
+
+# Run all tests in the workspace
+cargo test
+```
+
+### Running Examples
+
+The TUI crate includes an interactive chat example:
+
+```bash
+just chat
+# or
+cargo run -p enki-tui --example chat
+```
+
+## Test Patterns
+
+### Testing State Machines
+
+The Orchestrator, Scheduler, and DAG are pure state machines. Testing follows a simple pattern:
+
+```rust
+#[test]
+fn test_orchestrator_workflow() {
+    // 1. Create initial state
+    let mut orch = Orchestrator::new(db);
+    
+    // 2. Send command
+    let events = orch.handle(Command::CreateTask {
+        title: "Test task".into(),
+        description: "Do something".into(),
+        tier: Tier::Standard,
+    });
+    
+    // 3. Assert expected events
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], Event::SpawnWorker { .. }));
+    
+    // 4. Send next command based on events
+    let events = orch.handle(Command::WorkerDone(result));
+    
+    // 5. Verify state transitions
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], Event::QueueMerge(_)));
+}
+```
+
+### Testing the DAG Scheduler
+
+Test concurrency limits and dependency resolution:
+
+```rust
+#[test]
+fn test_scheduler_tier_limits() {
+    let limits = Limits {
+        max_light: 5,
+        max_standard: 3,
+        max_heavy: 1,
+    };
+    let mut scheduler = Scheduler::new(limits);
+    
+    // Create execution with multiple tasks
+    scheduler.create_execution(exec_id, dag);
+    
+    // Tick should respect tier limits
+    let actions = scheduler.tick();
+    
+    // Verify only max_standard tasks spawn
+    let spawn_count = actions.iter()
+        .filter(|a| matches!(a, SchedulerAction::Spawn { .. }))
+        .count();
+    assert!(spawn_count <= 3);
+}
+```
+
+### Testing DAG Dependencies
+
+Verify edge conditions (Merged, Completed, Started):
+
+```rust
+#[test]
+fn test_dag_edge_conditions() {
+    let mut dag = Dag::new();
+    
+    // Add nodes with dependency
+    dag.add_node("step1", task1);
+    dag.add_node("step2", task2);
+    dag.add_edge("step2", "step1", EdgeCondition::Started);
+    
+    // Mark step1 as Running
+    dag.transition("step1", NodeStatus::Running);
+    
+    // step2 should now be ready (Started condition satisfied)
+    let ready = dag.get_ready_nodes();
+    assert!(ready.contains(&"step2"));
+}
+```
+
+### Testing Signal File IPC
+
+Test the coordinator's signal file polling:
+
+```rust
+#[test]
+fn test_signal_file_processing() {
+    let temp_dir = tempdir().unwrap();
+    let events_dir = temp_dir.path().join("events");
+    fs::create_dir(&events_dir).unwrap();
+    
+    // Write a signal file
+    let signal = Signal::ExecutionCreated {
+        execution_id: "exec-123".into(),
+    };
+    let signal_path = events_dir.join("sig-test.json");
+    fs::write(&signal_path, serde_json::to_string(&signal).unwrap()).unwrap();
+    
+    // Process signals
+    let mut orch = Orchestrator::new_with_dir(db, temp_dir.path());
+    let events = orch.handle(Command::CheckSignals);
+    
+    // Verify signal was processed and file removed
+    assert!(!signal_path.exists());
+    assert!(events.iter().any(|e| matches!(e, Event::StatusMessage(_))));
+}
+```
+
+## Testing Two-Phase Worker Completion
+
+<Warning>
+The two-phase completion pattern is critical: `WorkerDone` (frees tier slot) → merge runs → `MergeDone` (advances DAG). Tests must verify both phases.
+</Warning>
+
+```rust
+#[test]
+fn test_two_phase_completion() {
+    let mut scheduler = Scheduler::new(limits);
+    
+    // Spawn worker, fills a tier slot
+    scheduler.handle_spawn(task_id, Tier::Standard);
+    assert_eq!(scheduler.active_count(Tier::Standard), 1);
+    
+    // Worker finishes → WorkerDone event
+    scheduler.handle_worker_done(task_id);
+    
+    // Tier slot should be freed immediately
+    assert_eq!(scheduler.active_count(Tier::Standard), 0);
+    
+    // But DAG should NOT advance until MergeDone
+    assert_eq!(dag.get_status(step_id), NodeStatus::WorkerDone);
+    
+    // Send MergeDone
+    scheduler.handle_merge_done(task_id);
+    
+    // Now DAG advances
+    assert_eq!(dag.get_status(step_id), NodeStatus::Done);
+}
+```
+
+## Debugging Tips
+
+### Check the Logs
+
+When debugging issues, always start with the logs:
+
+```bash
+# View the most recent session
+tail -n 200 ~/.enki/logs/enki.log
+
+# Find errors and warnings
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+
+# View a specific agent session
+cat ~/.enki/logs/sessions/<label>.log
+```
+
+Logs are structured with clear session boundaries:
+```
+══════════════════ SESSION START ══════════════════
+```
+
+### Inspect the Database
+
+The SQLite database is human-readable:
+
+```bash
+# Open the database
+sqlite3 .enki/db.sqlite
+
+# Check task statuses
+SELECT id, title, status, tier FROM tasks;
+
+# View executions
+SELECT id, status, dag FROM executions;
+
+# Check merge queue
+SELECT id, task_id, branch, status FROM merge_requests;
+```
+
+### Debug Signal Files
+
+Signal files are transient but you can catch them:
+
+```bash
+# Watch for signal files
+watch -n 0.5 ls -la .enki/events/
+
+# Manually inspect a signal file (if you're quick!)
+cat .enki/events/sig-*.json
+```
+
+### Test Copy-on-Write Behavior
+
+Verify CoW copies are working correctly:
+
+```bash
+# Check copy paths
+ls -la .enki/copies/
+
+# On macOS with APFS, clonefile should be instant
+du -sh .enki/copies/task-*
+
+# On Linux with btrfs, check reflink status
+filefrag -v .enki/copies/task-*/somefile
+```
+
+### Common Issues
+
+<AccordionGroup>
+  <Accordion title="!Send boundary violations">
+    **Problem**: Trying to send ACP types across threads
+    
+    **Symptom**: Compiler error about `Rc<RefCell<...>>` not implementing `Send`
+    
+    **Solution**: All ACP code must run on the coordinator's `LocalSet`. Never spawn ACP types onto the tokio runtime directly.
+    
+    ```rust
+    // ❌ Wrong
+    tokio::spawn(async move {
+        agent_manager.spawn_worker(task).await
+    });
+    
+    // ✅ Correct
+    local_set.spawn_local(async move {
+        agent_manager.spawn_worker(task).await
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="infra_broken flag triggered">
+    **Problem**: Copy operations failing, all subsequent spawns auto-fail
+    
+    **Symptom**: All tasks fail immediately without trying to spawn
+    
+    **Debugging**:
+    ```bash
+    # Check disk space
+    df -h
+    
+    # Verify CoW support
+    # macOS: should use APFS
+    diskutil list
+    
+    # Linux: should use btrfs or xfs
+    df -T
+    ```
+    
+    **Solution**: Fix the underlying filesystem issue. The `infra_broken` flag prevents cascading failures.
+  </Accordion>
+
+  <Accordion title="process_events cascade not draining">
+    **Problem**: Events pile up without being processed
+    
+    **Symptom**: Tasks stuck in Pending when they should spawn
+    
+    **Debugging**: Check coordinator's event processing loop:
+    
+    ```rust
+    while !events.is_empty() {
+        for event in events.drain(..) {
+            // Process each event
+            let new_events = process_event(event);
+            events.extend(new_events);
+        }
+    }
+    ```
+    
+    **Solution**: Ensure the coordinator drains events in a loop, since spawning a worker can fail and produce new events.
+  </Accordion>
+
+  <Accordion title="Merge conflicts not resolving">
+    **Problem**: Merger agent not spawning or failing silently
+    
+    **Symptom**: `MergeNeedsResolution` event but no merger activity
+    
+    **Debugging**:
+    ```bash
+    # Check for merger session logs
+    ls ~/.enki/logs/sessions/merger-*.log
+    
+    # Verify temp clone exists
+    ls -la /tmp/enki-merge-*
+    ```
+    
+    **Solution**: Merger uses `CleanupGuard` + `std::mem::forget` to keep temp dir alive. Ensure the guard isn't dropped prematurely.
+  </Accordion>
+</AccordionGroup>
+
+### Enable Debug Logging
+
+For verbose output during development:
+
+```bash
+# Set log level via environment variable
+RUST_LOG=debug cargo run --bin enki
+
+# Or per-crate
+RUST_LOG=enki_core=debug,enki_acp=trace cargo run
+```
+
+**Debug log output includes**:
+- Subprocess arguments
+- Copy paths and CoW status
+- Prompt sizes sent to agents
+- Session kill signals
+
+## Testing the Full Stack
+
+For end-to-end testing:
+
+<Steps>
+  <Step title="Build the binary">
+    ```bash
+    just install
+    ```
+  </Step>
+
+  <Step title="Create a test project">
+    ```bash
+    mkdir /tmp/enki-test
+    cd /tmp/enki-test
+    git init
+    echo "# Test" > README.md
+    git add README.md
+    git commit -m "Initial commit"
+    ```
+  </Step>
+
+  <Step title="Run Enki">
+    ```bash
+    enki
+    ```
+  </Step>
+
+  <Step title="Create a simple task">
+    In the TUI:
+    ```
+    Add a hello.txt file with the text "Hello, world!"
+    ```
+  </Step>
+
+  <Step title="Verify results">
+    ```bash
+    # Check the file was created
+    cat hello.txt
+    
+    # Check git history
+    git log --oneline
+    
+    # Inspect the database
+    sqlite3 .enki/db.sqlite "SELECT * FROM tasks;"
+    ```
+  </Step>
+</Steps>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture Deep Dive" icon="diagram-project" href="/development/architecture-deep-dive">
+    Understand the state machine patterns being tested
+  </Card>
+  <Card title="Setup Guide" icon="hammer" href="/development/setup">
+    Back to development environment setup
+  </Card>
+</CardGroup>

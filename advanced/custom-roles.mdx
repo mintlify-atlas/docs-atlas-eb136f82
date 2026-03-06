@@ -1,0 +1,292 @@
+---
+title: Custom Roles
+description: Create custom agent roles with TOML configuration files to define specialized behavior patterns.
+---
+
+Enki's role system lets you define custom agent behaviors by creating TOML configuration files. Roles determine what an agent can do, what tools it has access to, and how it approaches tasks.
+
+## Role Configuration
+
+Roles are defined in TOML files with the following structure:
+
+```toml roles/my_role.toml
+name = "my_role"
+label = "My Custom Role"
+description = "Brief description of what this role does and its output mode"
+can_edit = true
+output = "branch"  # or "artifact"
+system_prompt = """
+Your detailed system prompt here.
+
+This can be multi-line and should explain:
+- The agent's purpose and responsibilities
+- The workflow or phases it should follow
+- Any rules or constraints
+- How to report progress
+"""
+```
+
+### Role Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique identifier (use snake_case) |
+| `label` | string | Yes | Human-readable display name |
+| `description` | string | Yes | Brief summary of role purpose and output |
+| `system_prompt` | string | Yes | Detailed instructions for the agent |
+| `can_edit` | boolean | No | Whether agent can modify files (default: `true`) |
+| `output` | string | No | Output mode: `"branch"` (code changes) or `"artifact"` (markdown) (default: `"branch"`) |
+
+### Output Modes
+
+**Branch mode** (`output = "branch"`):
+- Agent produces code changes on a branch
+- Changes are merged by the refinery into main
+- Default for roles like `feature_developer`, `bug_fixer`, `ralph`
+
+**Artifact mode** (`output = "artifact"`):
+- Agent produces a markdown report saved to `.enki/artifacts/<exec>/<step>.md`
+- No code changes, no merge step
+- Used for read-only roles like `researcher`, `code_referencer`
+
+## Role Cascade
+
+Roles load in three layers, with later entries overriding earlier ones by `name`:
+
+1. **Built-in roles** (defined in `core/src/roles.rs`)
+2. **Global overrides** (`~/.enki/roles/*.toml`)
+3. **Project overrides** (`.enki/roles/*.toml`)
+
+This cascade allows you to:
+- Use built-in roles as-is
+- Customize built-in roles globally across all projects
+- Override roles per-project for specific needs
+
+<CodeGroup>
+```toml ~/.enki/roles/ralph.toml
+# Global customization: make Ralph more verbose
+name = "ralph"
+label = "Ralph"
+description = "Iterative verify-fix loop worker. Output: code changes (branch)."
+can_edit = true
+output = "branch"
+system_prompt = """
+You are Ralph, an iterative worker with detailed logging.
+
+## Workflow
+1. Run verification
+2. Report all failures in detail
+3. Fix one thing
+4. Repeat
+
+Log every step with full context.
+"""
+```
+
+```toml .enki/roles/custom_reviewer.toml
+# Project-specific role for code review
+name = "code_reviewer"
+label = "Code Reviewer"
+description = "Reviews code changes and suggests improvements. Output: markdown artifact (no code changes)."
+can_edit = false
+output = "artifact"
+system_prompt = """
+You are a code reviewer. Your job is to:
+
+1. Read the changed files
+2. Identify issues: bugs, performance problems, style violations, security concerns
+3. Suggest concrete improvements with examples
+4. Prioritize findings by severity
+
+Output a structured markdown report with:
+- Executive summary
+- Critical issues
+- Recommendations
+- Code snippets showing before/after
+
+Be constructive, specific, and actionable.
+"""
+```
+</CodeGroup>
+
+## Built-in Roles
+
+Enki ships with five built-in roles defined in `crates/core/src/roles.rs`:
+
+### feature_developer
+
+**Output:** Branch (code changes)
+
+**When to use:** Implementing new features, adding functionality, writing production code.
+
+**Workflow:**
+1. **Explore** — Study existing codebase patterns
+2. **Design** — Choose an implementation approach
+3. **Implement** — Write production code and tests
+4. **Self-Review** — Check for bugs and consistency
+
+### ralph
+
+**Output:** Branch (code changes)
+
+**When to use:** Tasks with clear programmatic success criteria (tests, builds, linters).
+
+**Workflow:**
+1. Run verification command
+2. Read the failures
+3. Fix one thing
+4. Repeat until everything passes
+
+<Tip>
+Ralph is optimized for grinding through verification failures. Don't use it for exploratory work or design decisions.
+</Tip>
+
+### bug_fixer
+
+**Output:** Branch (code changes)
+
+**When to use:** Diagnosing and fixing bugs, writing regression tests.
+
+**Approach:**
+- Find root cause (not symptoms)
+- Make minimal surgical fix
+- Add regression test
+- Verify no collateral damage
+
+### researcher
+
+**Output:** Artifact (markdown report)
+
+**When to use:** Investigating code, tracing execution paths, answering questions about the codebase.
+
+**Key constraint:** `can_edit = false` — read-only, produces findings report
+
+```toml Built-in researcher role
+name = "researcher"
+label = "Researcher"
+description = "Investigates code, reads files, traces execution paths. Output: markdown artifact (no code changes)."
+can_edit = false
+output = "artifact"
+system_prompt = """You are a research agent. Your job is to investigate the codebase thoroughly and report your findings.
+
+- Read files, trace code paths, search for patterns
+- Do NOT edit any files — you are read-only
+- Be precise: include file paths, line numbers, and code snippets in your report
+- Structure your findings clearly with markdown headings
+- Answer the specific question or investigate the specific area described in your task
+- Your findings will be saved as a markdown artifact for the team to reference"""
+```
+
+### code_referencer
+
+**Output:** Artifact (markdown report)
+
+**When to use:** Looking up external code from GitHub repos, fetching documentation, finding reference patterns.
+
+**Key constraint:** `can_edit = false` — fetches external code but doesn't modify project files
+
+## Use Cases
+
+### Read-only Investigation Role
+
+Set `can_edit = false` and `output = "artifact"` for roles that gather information without modifying code:
+
+```toml .enki/roles/security_auditor.toml
+name = "security_auditor"
+label = "Security Auditor"
+description = "Audits code for security vulnerabilities. Output: markdown artifact (no code changes)."
+can_edit = false
+output = "artifact"
+system_prompt = """
+You are a security auditor.
+
+1. Scan for common vulnerabilities: SQL injection, XSS, CSRF, auth bypass, secrets in code
+2. Check dependencies for known CVEs
+3. Review authentication and authorization logic
+4. Flag any suspicious patterns
+
+Output a markdown report with:
+- Risk summary (high/medium/low)
+- Detailed findings with file:line references
+- Remediation steps
+"""
+```
+
+### Specialized Code Generator
+
+Create focused roles for specific types of code generation:
+
+```toml .enki/roles/test_writer.toml
+name = "test_writer"
+label = "Test Writer"
+description = "Writes comprehensive tests for existing code. Output: code changes (branch)."
+can_edit = true
+output = "branch"
+system_prompt = """
+You are a test writer.
+
+1. Read the implementation code
+2. Identify testable behaviors and edge cases
+3. Write tests matching the project's testing patterns
+4. Cover: happy path, error cases, boundary conditions, edge cases
+5. Run tests to verify they pass
+
+Follow the project's test structure:
+- Study existing test files for naming, organization, assertion style
+- Use the same test framework and helpers
+- Match the level of granularity (unit vs integration)
+"""
+```
+
+### Domain-specific Expert
+
+```toml .enki/roles/db_expert.toml
+name = "database_expert"
+label = "Database Expert"
+description = "Designs and implements database schemas, migrations, queries. Output: code changes (branch)."
+can_edit = true
+output = "branch"
+system_prompt = """
+You are a database expert specializing in schema design and query optimization.
+
+## Responsibilities
+- Design normalized schemas with appropriate indexes
+- Write efficient migrations (up and down)
+- Optimize slow queries
+- Handle data integrity constraints
+- Consider concurrency and locking
+
+## Principles
+- Normalize to 3NF unless there's a documented reason not to
+- Index foreign keys and frequently queried columns
+- Use transactions for multi-step changes
+- Write migrations that are safe to run in production (no downtime)
+- Test migrations both up and down
+"""
+```
+
+## Tool Access by Role Type
+
+Roles are assigned to one of three **MCP tool access tiers** based on context:
+
+| Tier | Tools | When Used |
+|------|-------|----------|
+| `planner` | Full access (task creation, execution control, mail) | Coordinator agent |
+| `worker` | Task list, worker_report, edit_file (if `can_edit=true`), mail | Task execution agents |
+| `worker` (no_edit) | Task list, worker_report, mail (no edit_file) | Agents with `can_edit=false` |
+| `merger` | Minimal (status, task list only) | Merge conflict resolution |
+
+The `can_edit` field controls whether workers get the `enki_edit_file` tool. See [MCP Tools](/advanced/mcp-tools) for details.
+
+<Warning>
+Changing a role's `can_edit` or `output` after tasks are in flight can cause merge failures. Roles are evaluated when a worker spawns.
+</Warning>
+
+## Tips
+
+- **Start with built-ins:** Clone a similar built-in role and modify it
+- **Test in isolation:** Create a standalone task with your custom role before using it in complex executions
+- **Be specific:** Generic prompts produce generic behavior. Detailed workflows produce consistent results.
+- **Use phases:** Structure multi-step work into numbered phases (Explore → Design → Implement)
+- **Include examples:** Show the agent what good output looks like
+- **Constrain scope:** Narrow roles work better than broad ones

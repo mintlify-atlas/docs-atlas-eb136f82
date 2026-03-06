@@ -1,0 +1,203 @@
+---
+title: 'Development Setup'
+description: 'Set up your development environment to build and run Enki from source'
+---
+
+## Prerequisites
+
+Before building Enki from source, ensure you have the following installed:
+
+- **[Rust](https://rustup.rs/)** - Required for building the project (2024 edition)
+- **[Git](https://git-scm.com/)** - For version control
+- **[Node.js](https://nodejs.org/)** - Used to install and run the ACP agent
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** - The agent that Enki orchestrates
+- **[just](https://github.com/casey/just)** (optional) - Command runner for convenience
+
+## Getting Started
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/korbindeman/enki.git
+    cd enki
+    ```
+  </Step>
+
+  <Step title="Build the project">
+    Build all crates in the workspace:
+    ```bash
+    cargo build
+    ```
+
+    For a release build with optimizations:
+    ```bash
+    cargo build --release
+    ```
+  </Step>
+
+  <Step title="Install locally">
+    Install the `enki` binary to `~/.cargo/bin`:
+    ```bash
+    just install
+    ```
+
+    Or manually:
+    ```bash
+    cargo install --path crates/cli
+    ```
+  </Step>
+
+  <Step title="Run Enki">
+    Launch the TUI:
+    ```bash
+    just run
+    ```
+
+    Or directly:
+    ```bash
+    cargo run --bin enki
+    ```
+
+    Pass arguments through:
+    ```bash
+    just run --help
+    ```
+  </Step>
+</Steps>
+
+## Workspace Structure
+
+Enki is a Rust workspace with four crates following strict dependency direction: `cli` → `tui`, `acp`, `core`. No cycles.
+
+| Crate | Path | Role |
+|-------|------|------|
+| `core` | `crates/core` | Pure synchronous state machines: Orchestrator, DAG scheduler, SQLite persistence, CoW copy manager, git merge refinery, roles, hashlines. Zero async, zero tokio. |
+| `acp` | `crates/acp` | Async ACP client. Spawns agent subprocesses, manages sessions, routes streaming updates. All internal state is `Rc<RefCell<...>>` — `!Send`, must run on a `LocalSet`. |
+| `tui` | `crates/tui` | Sync terminal UI library over raw `crossterm` (not ratatui). Chat framework via `Handler<M>` trait. Optional `markdown` feature for `termimad`+`syntect` rendering. |
+| `cli` | `crates/cli` | The `enki` binary. No args → TUI. `enki mcp` → JSON-RPC stdio server. Houses the coordinator loop (`tokio::select!` on a dedicated OS thread with `current_thread` runtime + `LocalSet`). |
+
+## Just Commands
+
+The project includes a `justfile` for common development tasks:
+
+```bash
+# Run the enki CLI (passes through arguments)
+just run [ARGS]
+
+# Run the TUI chat example from enki-tui crate
+just chat
+
+# Build and install release binary to ~/.cargo/bin
+just install
+
+# Create a date-based release tag (e.g., v2026.03.06)
+just release
+```
+
+## Running Tests
+
+Core functionality has inline unit and integration tests:
+
+```bash
+# Run all tests in the core crate
+cargo test -p enki-core
+
+# Run tests for a specific crate
+cargo test -p enki-acp
+cargo test -p enki-tui
+cargo test -p enki-cli
+
+# Run all tests in the workspace
+cargo test
+```
+
+See [Testing](/development/testing) for detailed testing strategies.
+
+## Development Workflow
+
+### Making Changes
+
+1. **Edit code** in the appropriate crate based on what you're changing:
+   - State machine logic → `crates/core`
+   - ACP client functionality → `crates/acp`
+   - Terminal rendering → `crates/tui`
+   - CLI commands or coordinator → `crates/cli`
+
+2. **Run tests** to verify your changes:
+   ```bash
+   cargo test -p enki-core
+   ```
+
+3. **Test locally** by running the binary:
+   ```bash
+   just run
+   ```
+
+### Build Artifacts
+
+Release builds are optimized with:
+- Symbol stripping (`strip = true`)
+- Link-time optimization (`lto = true`)
+
+See `Cargo.toml` profile settings for details.
+
+## Environment Variables
+
+Enki uses several environment variables during operation:
+
+| Variable | Purpose |
+|----------|----------|
+| `ENKI_BIN` | Path to own binary, injected into all subprocesses |
+| `ENKI_DIR` | Project `.enki/` directory for DB + signal files |
+| `ENKI_SESSION_ID` | Scopes MCP tool results to current session |
+| `CLAUDECODE` | Cleared on agent spawn to prevent nested-session refusal |
+
+These are typically set automatically by Enki itself.
+
+## Project Directory (`.enki/`)
+
+When you run Enki in a project, it creates a `.enki/` directory:
+
+```
+.enki/
+├── db.sqlite          # SQLite (WAL mode), DAG stored as JSON blob
+├── roles/*.toml       # Project-specific role overrides
+├── artifacts/<exec>/<step>.md  # Artifact output mode files
+├── events/sig-*.json  # Signal files (IPC)
+└── verify.sh          # Optional merge hook (exit non-zero = fail merge)
+```
+
+## Logs
+
+Development and debugging logs are stored in:
+
+- **Main log**: `~/.enki/logs/enki.log`
+  - Sessions separated by `══════════════════ SESSION START ══════════════════`
+  - Most recent session is at the bottom
+
+- **Per-agent logs**: `~/.enki/logs/sessions/<label>.log`
+  - Timestamped JSON-RPC traffic
+
+```bash
+# View the end of the most recent session
+tail -n 200 ~/.enki/logs/enki.log
+
+# Find problems quickly
+grep "ERROR\|WARN" ~/.enki/logs/enki.log
+```
+
+**Log levels**:
+- `ERROR` = failures
+- `INFO` = lifecycle events
+- `DEBUG` = subprocess args, copy paths, prompt sizes, session kills
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Testing" icon="flask" href="/development/testing">
+    Learn about testing patterns and debugging strategies
+  </Card>
+  <Card title="Architecture Deep Dive" icon="diagram-project" href="/development/architecture-deep-dive">
+    Understand the internal architecture and design patterns
+  </Card>
+</CardGroup>
